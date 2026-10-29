@@ -75,7 +75,7 @@ pub struct ProgramOptions {
     pub checker_regions: bool,
     /// tsrs-only, with `checker_regions`: the diagnostics each checker makes go to a region of its own, which
     /// `free_program` gives back too (checkerpool.rs `SlotChecker`): the caller copies those it keeps (watch
-    /// mode's snapshot, `tsrs_incremental` `Program::copy_diagnostics`).
+    /// mode's snapshot, `tsrs_incremental` `Program::copy_diagnostics`). So does what escapes the checkers' regions.
     pub checker_diagnostic_regions: bool,
     /// tsrs-only: what the file loader allocates goes to these regions (programregions.rs), which the caller frees
     /// once nothing uses the program's processed-file and resolution data (watch mode, `tsc -b`).
@@ -260,6 +260,9 @@ pub struct Program {
     // tsrs-only: the address of the program `reuse_program` made this one from, 0 for a program built in full
     // (`is_reuse_of`). An address, not a reference: the watch frees that program once this one has replaced it.
     reused_from: usize,
+    // tsrs-only, with `checker_diagnostic_regions`: what escapes the scratch regions of the pool's checkers, one region
+    // per thread (checkerpool.rs `SlotChecker`). After `checker_pool`: its checkers point into these regions.
+    pub(crate) checker_escapes: crate::programregions::ProgramRegions,
     // tsrs-only: what `reuse_program` allocated for this program when its programs are freed (`checker_regions`):
     // the file list and the resolution data with its copy of the package.json cache table, about 40 KB per edit on a
     // 4k-file project. Last: the fields above point into it.
@@ -568,6 +571,7 @@ pub fn new_program(opts: ProgramOptions) -> &'static Program {
         checker_diagnostic_regions: opts.checker_diagnostic_regions,
         reuse_synthetic_imports: opts.reuse_synthetic_imports,
         reused_from: 0,
+        checker_escapes: crate::programregions::ProgramRegions::default(),
         own_region: None,
     };
     // Go initializes the checker pool before verifying options; the pool factory takes the program by
@@ -835,6 +839,7 @@ impl Program {
             checker_diagnostic_regions: self.checker_diagnostic_regions,
             reuse_synthetic_imports: self.reuse_synthetic_imports,
             reused_from: std::ptr::from_ref(self) as usize,
+            checker_escapes: crate::programregions::ProgramRegions::default(),
             own_region,
         };
         try_reuse(&result.unresolved_imports, &self.unresolved_imports);

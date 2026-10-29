@@ -546,3 +546,45 @@ fn repeated_js_and_declaration_emit_with_shared_context() {
     program.emit(&Context::default(), &options);
     assert_eq!(*written.lock().unwrap(), first);
 }
+
+static ESCAPED_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+struct DropCounted;
+
+impl Drop for DropCounted {
+    fn drop(&mut self) {
+        ESCAPED_DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// tsrs-only: with `checker_diagnostic_regions` (watch mode), what escapes a pool checker's scratch region
+// (`arena::escape_scratch`: the program caches module specifier generation fills through the emit host, among others)
+// lives as long as the program, not the thread: it is freed with the program (`Program::checker_escapes`). A thread's
+// own arena, where it went before, is never freed and never runs its values' drops.
+#[test]
+fn what_escapes_a_pool_checkers_region_is_freed_with_its_program() {
+    let files = [
+        ("/src/tsconfig.json", r#"{"compilerOptions":{"noLib":true,"types":[],"checkers":2}}"#),
+        ("/src/a.ts", "export const a = 1;"),
+        ("/src/b.ts", "export const b = 2;"),
+        ("/src/c.ts", "export const c = 3;"),
+        ("/src/d.ts", "export const d = 4;"),
+    ];
+    let mut options = ProgramOptions::new(config_for(&files), host_for(&files));
+    options.checker_regions = true;
+    options.checker_diagnostic_regions = true;
+    let program = new_program(options);
+    program.bind_source_files();
+    let checked: Vec<_> = program.get_source_files().to_vec();
+    let escaped = AtomicUsize::new(0);
+    program.for_each_checker_group(&checked, |_checker, _, _| {
+        let _escape = tsrs_core::arena::escape_scratch();
+        let _ = P::new(DropCounted);
+        escaped.fetch_add(1, Ordering::SeqCst);
+    });
+    assert_eq!(escaped.load(Ordering::SeqCst), checked.len());
+    assert_eq!(ESCAPED_DROPS.load(Ordering::SeqCst), 0, "nothing is freed while the program lives");
+    // SAFETY: no checker of the program's pool is held, and nothing refers to it.
+    unsafe { tsrs_compiler::free_program(program) };
+    assert_eq!(ESCAPED_DROPS.load(Ordering::SeqCst), checked.len());
+}
