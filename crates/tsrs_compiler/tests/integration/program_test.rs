@@ -546,3 +546,50 @@ fn repeated_js_and_declaration_emit_with_shared_context() {
     program.emit(&Context::default(), &options);
     assert_eq!(*written.lock().unwrap(), first);
 }
+
+// Interleaving by checker alternates the checkers while more than one has files left, and keeps each checker's files
+// in their order.
+#[test]
+fn files_interleaved_by_checker_alternate_the_checkers() {
+    let names: Vec<String> = (0..8).map(|i| format!("f{i}.ts")).collect();
+    let config = format!(
+        r#"{{"compilerOptions":{{"noLib":true,"types":[],"checkers":2}},"files":[{}]}}"#,
+        names.iter().map(|name| format!("\"{name}\"")).collect::<Vec<_>>().join(",")
+    );
+    let texts: Vec<(String, String)> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (format!("/src/{name}"), format!("export const v{i} = {i};\n")))
+        .collect();
+    let mut files: Vec<(&str, &str)> = vec![("/src/tsconfig.json", config.as_str())];
+    files.extend(texts.iter().map(|(path, text)| (path.as_str(), text.as_str())));
+    let program = new_program(ProgramOptions::new(config_for(&files), host_for(&files)));
+    let pool = program.compiler_checker_pool().expect("built-in pool");
+    let sources: Vec<_> = program
+        .get_source_files()
+        .iter()
+        .copied()
+        .filter(|file| file.file_name().starts_with("/src/f"))
+        .collect();
+    let interleaved = pool.interleave_by_checker(&sources);
+
+    let mut sorted_in: Vec<_> = sources.iter().map(|file| file.file_name().to_string()).collect();
+    let mut sorted_out: Vec<_> =
+        interleaved.iter().map(|file| file.file_name().to_string()).collect();
+    sorted_in.sort();
+    sorted_out.sort();
+    assert_eq!(sorted_out, sorted_in);
+
+    let mut queues: [std::collections::VecDeque<_>; 2] = Default::default();
+    for &file in &sources {
+        queues[pool.checker_of(file).unwrap()].push_back(file);
+    }
+    assert!(queues.iter().all(|queue| !queue.is_empty()), "both checkers have files");
+    let mut expected = Vec::new();
+    while queues.iter().any(|queue| !queue.is_empty()) {
+        for queue in &mut queues {
+            expected.extend(queue.pop_front());
+        }
+    }
+    assert_eq!(interleaved, expected);
+}

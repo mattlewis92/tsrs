@@ -824,6 +824,39 @@ impl CheckerPoolImpl {
         }
     }
 
+    /// tsrs-only: the checker that runs `file` (its static assignment, unless stealing moved it), or `None` for a file
+    /// of another program.
+    pub fn checker_of(&self, file: P<SourceFile>) -> Option<usize> {
+        self.create_checkers().owner_of(file)
+    }
+
+    /// tsrs-only: `files`, reordered so that each checker's files alternate with the other checkers' (round robin over
+    /// the checkers, each checker's files in their order in `files`), files of no checker last. Assignment keeps nearby
+    /// program files on one checker, so a run of consecutive files is mostly one checker's, which a pass then runs one
+    /// after another; any run of the reordered files spreads over the checkers instead.
+    pub fn interleave_by_checker(&self, files: &[P<SourceFile>]) -> Vec<P<SourceFile>> {
+        let state = self.create_checkers();
+        let mut queues: Vec<std::collections::VecDeque<P<SourceFile>>> =
+            vec![std::collections::VecDeque::new(); state.checkers.len()];
+        let mut unowned = Vec::new();
+        for &file in files {
+            match state.owner_of(file) {
+                Some(owner) => queues[owner].push_back(file),
+                None => unowned.push(file),
+            }
+        }
+        let mut interleaved = Vec::with_capacity(files.len());
+        while interleaved.len() + unowned.len() < files.len() {
+            for queue in &mut queues {
+                if let Some(file) = queue.pop_front() {
+                    interleaved.push(file);
+                }
+            }
+        }
+        interleaved.extend(unowned);
+        interleaved
+    }
+
     // checkerpool.go:331
     // GetChecker implements CheckerPool. When file is non-nil, returns the checker
     // associated with that file; otherwise returns the first checker.

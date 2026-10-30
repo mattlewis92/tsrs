@@ -206,6 +206,11 @@ impl Program {
                         .is_some_and(|info| info.signature == info.version)
             })
             .collect();
+        // An emit runs each checker's files one after another; in program order a chunk is mostly one checker's.
+        let files = match program.compiler_checker_pool() {
+            Some(pool) => pool.interleave_by_checker(&files),
+            None => files,
+        };
         let stored = std::sync::atomic::AtomicUsize::new(0);
         let write_file =
             |file_name: &str, text: &str, data: &mut WriteFileData| -> Result<(), String> {
