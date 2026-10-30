@@ -1362,18 +1362,25 @@ pub(crate) fn scratch_arena() -> *const Arena {
 
 impl Drop for RegionInner {
     fn drop(&mut self) {
+        // The objects the region owns (`adopt_owner`) are unregistered before the `on_free` callbacks, which may free
+        // them (the language server's shared program data): once an object is freed, another region may adopt an
+        // object at the same address, and removing the key after that would remove the new owner's.
+        let owners = std::mem::take(self.owners.get_mut().unwrap());
+        if !owners.is_empty() {
+            let mut reg = REGISTRY.write().unwrap();
+            for addr in owners {
+                reg.remove(&reg_key(addr));
+            }
+        }
         for f in self.on_free.get_mut().unwrap().drain(..) {
             f();
         }
         let arena = &*self.arena;
         let chunks = arena.chunks();
-        if arena.registered || !self.owners.get_mut().unwrap().is_empty() {
+        if arena.registered {
             let mut reg = REGISTRY.write().unwrap();
             for &(start, _) in &chunks {
                 reg.remove(&reg_key(start));
-            }
-            for addr in self.owners.get_mut().unwrap().drain(..) {
-                reg.remove(&reg_key(addr));
             }
         }
         let drops = std::mem::take(&mut *arena.drops.borrow_mut());

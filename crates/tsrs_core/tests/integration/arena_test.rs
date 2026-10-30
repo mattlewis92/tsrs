@@ -268,3 +268,27 @@ fn small_regions_share_slabs_and_trim() {
     assert!(Region::containing(y.addr()).unwrap().ptr_eq(&b));
     assert_eq!(*y, [8; 4]);
 }
+
+// A region unregisters the objects it owns (`adopt_owner`) before its `on_free` callbacks free them: once freed, an
+// object's address can be handed out again and adopted by another region (the language server's next full build, for
+// the shared processed-file data), and that region must stay its owner.
+#[test]
+fn a_regions_owned_objects_are_unregistered_before_its_on_free_callbacks() {
+    use tsrs_core::arena::Region;
+    let object = Box::new(0u64);
+    let addr = std::ptr::from_ref(&*object) as usize;
+    let first = Region::new(4 << 10);
+    first.adopt_owner(addr);
+    assert!(Region::containing(addr).unwrap().ptr_eq(&first));
+    let next = Region::new(4 << 10);
+    let adopter = next.clone();
+    first.on_free(Box::new(move || {
+        // The object is freed here, and the next owner takes its address.
+        adopter.adopt_owner(addr);
+    }));
+    drop(first);
+    assert!(Region::containing(addr).unwrap().ptr_eq(&next));
+    drop(next);
+    assert!(Region::containing(addr).is_none());
+    drop(object);
+}
