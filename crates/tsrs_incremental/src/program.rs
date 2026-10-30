@@ -230,7 +230,8 @@ impl Program {
             if ctx.err().is_some() {
                 break;
             }
-            program.emit(
+            // A new cycle cancels the job and waits for it: it waits for the files in flight only.
+            program.emit_until_canceled(
                 ctx,
                 &EmitOptions {
                     target_source_files: Some(files.to_vec()),

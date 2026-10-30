@@ -194,6 +194,18 @@ impl Program {
         )
     }
 
+    /// tsrs-only: `emit`, except that once `ctx` is canceled the files that have not started are skipped (their
+    /// results are `emit_skipped`, nothing is written). The watch's background signature job emits with it, so that a
+    /// new cycle, which cancels the job, waits only for the files in flight.
+    pub fn emit_until_canceled(&'static self, ctx: &Context, options: &EmitOptions) -> EmitResult {
+        combine_emit_results(
+            self.emit_files(ctx, options, true)
+                .into_iter()
+                .map(|(_, result)| Some(result))
+                .collect(),
+        )
+    }
+
     /// The emit of `emit`, with each emitted file's result kept apart (in emit order), and without the `noEmit` /
     /// `noEmitOnError` handling (`handle_no_emit_options`), which the caller applies. The files run on their checkers'
     /// threads, so one call over many files is the parallel equivalent of a call per file (the incremental emit).
@@ -201,6 +213,17 @@ impl Program {
         &'static self,
         ctx: &Context,
         options: &EmitOptions,
+    ) -> Vec<(P<SourceFile>, EmitResult)> {
+        self.emit_files(ctx, options, false)
+    }
+
+    /// `emit_each_file`; with `skip_once_canceled`, files not started once `ctx` is canceled are skipped
+    /// (`emit_until_canceled`).
+    fn emit_files(
+        &'static self,
+        ctx: &Context,
+        options: &EmitOptions,
+        skip_once_canceled: bool,
     ) -> Vec<(P<SourceFile>, EmitResult)> {
         let new_line = self.options().new_line.get_new_line_character();
         let force_dts_emit = options.emit_only == EmitOnly::EmitOnlyBuilderSignature
@@ -297,12 +320,10 @@ impl Program {
             drop(region);
             *results[index].lock().unwrap() = Some(result);
         };
-        // A canceled signature emit (the watch's background signature job, which a new cycle cancels) skips the files
-        // it has not started: their signatures stay stand-ins, which the next job computes. Any other emit runs to the
-        // end, as Go's does.
+        // tsrs-only (`emit_until_canceled`): the files not started once `ctx` is canceled are skipped. Any other emit
+        // runs to the end, as Go's does.
         let skip_canceled = |index: usize| {
-            let skip =
-                options.emit_only == EmitOnly::EmitOnlyBuilderSignature && ctx.err().is_some();
+            let skip = skip_once_canceled && ctx.err().is_some();
             if skip {
                 *results[index].lock().unwrap() =
                     Some(EmitResult { emit_skipped: true, ..Default::default() });

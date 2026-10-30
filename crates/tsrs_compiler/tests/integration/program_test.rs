@@ -547,10 +547,11 @@ fn repeated_js_and_declaration_emit_with_shared_context() {
     assert_eq!(*written.lock().unwrap(), first);
 }
 
-// The watch's signature job emits declaration signatures with a context a new cycle cancels: a canceled signature
-// emit skips the files it has not started, while any other emit runs to the end.
+// The watch's signature job emits declaration signatures with a context a new cycle cancels: `emit_until_canceled`
+// skips the files it has not started once the context is canceled, while any other emit, the builder's own
+// signature emit included, runs to the end.
 #[test]
-fn a_canceled_signature_emit_skips_its_files() {
+fn an_emit_until_canceled_skips_the_files_it_has_not_started() {
     let files = [
         (
             "/src/tsconfig.json",
@@ -579,12 +580,16 @@ fn a_canceled_signature_emit_skips_its_files() {
     written.lock().unwrap().clear();
     let (canceled, cancel) = Context::default().with_cancel();
     cancel.call();
-    let results = program.emit_each_file(&canceled, &signatures);
+    let result = program.emit_until_canceled(&canceled, &signatures);
     assert_eq!(*written.lock().unwrap(), [] as [String; 0]);
-    assert_eq!(results.len(), 3);
-    assert!(results.iter().all(|(_, result)| result.emit_skipped));
+    assert!(result.emit_skipped);
+
+    // The builder's signature emit (`compute_dts_signature`), as Go's, runs to the end under a canceled context.
+    let results = program.emit_each_file(&canceled, &signatures);
+    assert_eq!(written.lock().unwrap().len(), 3);
+    assert!(results.iter().all(|(_, result)| !result.emit_skipped));
 
     let all = tsrs_compiler::EmitOptions { write_file: Some(&write_file), ..Default::default() };
     program.emit(&canceled, &all);
-    assert_eq!(written.lock().unwrap().len(), 6);
+    assert_eq!(written.lock().unwrap().len(), 9);
 }
