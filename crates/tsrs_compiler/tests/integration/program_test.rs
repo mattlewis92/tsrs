@@ -546,3 +546,45 @@ fn repeated_js_and_declaration_emit_with_shared_context() {
     program.emit(&Context::default(), &options);
     assert_eq!(*written.lock().unwrap(), first);
 }
+
+// The watch's signature job emits declaration signatures with a context a new cycle cancels: a canceled signature
+// emit skips the files it has not started, while any other emit runs to the end.
+#[test]
+fn a_canceled_signature_emit_skips_its_files() {
+    let files = [
+        (
+            "/src/tsconfig.json",
+            r#"{"compilerOptions":{"noLib":true,"types":[],"declaration":true},"files":["a.ts","b.ts","c.ts"]}"#,
+        ),
+        ("/src/a.ts", "export const a = 1;\n"),
+        ("/src/b.ts", "export const b = 'b';\n"),
+        ("/src/c.ts", "export function c() { return true; }\n"),
+    ];
+    let program = new_program(ProgramOptions::new(config_for(&files), host_for(&files)));
+    let written = Mutex::new(Vec::<String>::new());
+    let write_file =
+        |name: &str, _: &str, _: &mut tsrs_compiler::WriteFileData| -> Result<(), String> {
+            written.lock().unwrap().push(name.to_string());
+            Ok(())
+        };
+    let signatures = tsrs_compiler::EmitOptions {
+        emit_only: tsrs_compiler::EmitOnly::EmitOnlyBuilderSignature,
+        write_file: Some(&write_file),
+        ..Default::default()
+    };
+
+    program.emit(&Context::default(), &signatures);
+    assert_eq!(written.lock().unwrap().len(), 3);
+
+    written.lock().unwrap().clear();
+    let (canceled, cancel) = Context::default().with_cancel();
+    cancel.call();
+    let results = program.emit_each_file(&canceled, &signatures);
+    assert_eq!(*written.lock().unwrap(), [] as [String; 0]);
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|(_, result)| result.emit_skipped));
+
+    let all = tsrs_compiler::EmitOptions { write_file: Some(&write_file), ..Default::default() };
+    program.emit(&canceled, &all);
+    assert_eq!(written.lock().unwrap().len(), 6);
+}

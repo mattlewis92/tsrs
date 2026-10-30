@@ -297,6 +297,18 @@ impl Program {
             drop(region);
             *results[index].lock().unwrap() = Some(result);
         };
+        // A canceled signature emit (the watch's background signature job, which a new cycle cancels) skips the files
+        // it has not started: their signatures stay stand-ins, which the next job computes. Any other emit runs to the
+        // end, as Go's does.
+        let skip_canceled = |index: usize| {
+            let skip =
+                options.emit_only == EmitOnly::EmitOnlyBuilderSignature && ctx.err().is_some();
+            if skip {
+                *results[index].lock().unwrap() =
+                    Some(EmitResult { emit_skipped: true, ..Default::default() });
+            }
+            skip
+        };
 
         match self.compiler_checker_pool() {
             // Printing and writing do not need the checker (`emitter::print`), so they run on the worker pool while
@@ -307,6 +319,9 @@ impl Program {
                 let pending = PendingPrints::default();
                 crate::program::worker_pool().in_place_scope(|scope| {
                     pool.for_each_checker_group_do(&source_files, false, |c, index, file| {
+                        if skip_canceled(index) {
+                            return;
+                        }
                         let e = transform(c, file);
                         pending.acquire();
                         let (print, pending) = (&print, &pending);
@@ -318,10 +333,15 @@ impl Program {
                 });
             }
             Some(pool) => pool.for_each_checker_group_do(&source_files, true, |c, index, file| {
-                print(transform(c, file), index);
+                if !skip_canceled(index) {
+                    print(transform(c, file), index);
+                }
             }),
             None => {
                 for (index, &file) in source_files.iter().enumerate() {
+                    if skip_canceled(index) {
+                        continue;
+                    }
                     let e = {
                         let mut guard = self.get_type_checker_for_file(ctx, file);
                         transform(&mut guard, file)
