@@ -488,7 +488,7 @@ const SURFACE = [
     ["pub(crate)","field","VariableDeclaration","initializer type_"],
     ["pub(crate)","field","VoidExpression","expression"],
     ["pub(crate)","field","WithStatement","statement"],
-    ["pub(crate)","fn","","is_as_expression is_jsdoc_deprecated_tag is_jsdoc_name_reference"],
+    ["pub(crate)","fn","","is_jsdoc_deprecated_tag is_jsdoc_name_reference"],
     ["pub(crate)","fn","ClassLikeBase","modifiers name type_parameters"],
     ["pub(crate)","fn","ConstructorDeclaration","full_signature"],
     ["pub(crate)","fn","EnumMember","postfix_token"],

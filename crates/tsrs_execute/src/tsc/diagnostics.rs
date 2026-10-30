@@ -26,7 +26,7 @@ pub type DiagnosticReporter<'a> = Box<dyn Fn(P<Diagnostic>) + Send + Sync + 'a>;
 // Go `io.Writer` for the reporters: `sys.Writer()` or a build task's output buffer.
 pub(crate) type Writer<'a> = std::sync::Arc<dyn Fn(&str) + Send + Sync + 'a>;
 
-pub(crate) fn create_diagnostic_reporter<'a>(
+pub fn create_diagnostic_reporter<'a>(
     sys: &'a dyn System,
     options: Option<&CompilerOptions>,
 ) -> DiagnosticReporter<'a> {
@@ -58,14 +58,13 @@ pub(crate) fn create_diagnostic_reporter_with_writer<'a>(
 }
 
 /// Formats a diagnostic into a buffer, as the reporter of `create_diagnostic_reporter` writes it.
-pub(crate) type DiagnosticFormatter<'a> =
-    Box<dyn Fn(&mut Vec<u8>, P<Diagnostic>) + Send + Sync + 'a>;
+pub type DiagnosticFormatter<'a> = Box<dyn Fn(&mut Vec<u8>, P<Diagnostic>) + Send + Sync + 'a>;
 
 /// tsrs-only: the text `create_diagnostic_reporter(sys, options)` writes for each diagnostic.
 ///
 /// `None` when that reporter writes nothing itself (`--quiet`, or a system with a diagnostic sink). Lets the report
 /// loop format many diagnostics in parallel and write them in order (`EmitInput::format_diagnostic`).
-pub(crate) fn create_diagnostic_formatter<'a>(
+pub fn create_diagnostic_formatter<'a>(
     sys: &'a dyn System,
     options: Option<&CompilerOptions>,
 ) -> Option<DiagnosticFormatter<'a>> {
@@ -140,7 +139,7 @@ pub(crate) fn create_builder_status_reporter<'a>(
 
 // diagnostics.go:168 CreateWatchStatusReporter: clears the screen before a compilation starts, then writes the status
 // with its time stamp and a blank line.
-pub(crate) fn create_watch_status_reporter<'a>(
+pub fn create_watch_status_reporter<'a>(
     sys: &'a dyn System,
     options: &CompilerOptions,
     testing: Option<&'a dyn super::CommandLineTesting>,
@@ -209,7 +208,7 @@ fn should_be_pretty(sys: &dyn System, options: Option<&CompilerOptions>) -> bool
 
 pub type DiagnosticsReporter<'a> = Box<dyn Fn(&[P<Diagnostic>]) + Send + Sync + 'a>;
 
-pub(crate) fn create_report_error_summary<'a>(
+pub fn create_report_error_summary<'a>(
     sys: &'a dyn System,
     options: &CompilerOptions,
 ) -> DiagnosticsReporter<'a> {

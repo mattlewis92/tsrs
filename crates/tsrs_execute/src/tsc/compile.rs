@@ -88,7 +88,7 @@ fn new_content_mapper_logger(sys: &'static dyn System) -> Option<contentmapper::
 // Close it when the compilation session ends.
 // compile.go:89 (Go binds the host to the command's context, which closes it when the process ends; the callers
 // close it explicitly instead. The locale is the option's text: tsrs does not canonicalize BCP 47 tags.)
-pub(crate) fn new_content_mapper_host(
+pub fn new_content_mapper_host(
     sys: &'static dyn System,
     options: &CompilerOptions,
 ) -> Option<Arc<dyn contentmapper::Host>> {
@@ -209,7 +209,7 @@ pub type MTimesCache = std::sync::Arc<
 >;
 
 // emit.go:21 GetTraceWithWriterFromSys
-pub(crate) fn get_trace_with_writer_from_sys(
+pub fn get_trace_with_writer_from_sys(
     w: SyncWriter,
     is_sys_writer: bool,
     testing: Option<&'static dyn CommandLineTesting>,

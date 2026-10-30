@@ -1,6 +1,7 @@
 mod commandlineparser_test;
 mod contentmappers_test;
 mod decls_test;
+mod embedding_test;
 mod gojson_test;
 mod parsedcommandline_common_source_directory_region_test;
 mod parsedoptions_test;

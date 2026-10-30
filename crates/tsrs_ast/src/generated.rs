@@ -19787,7 +19787,7 @@ pub fn is_function_expression(node: P<Node>) -> bool {
     node.kind() == Kind::FunctionExpression
 }
 
-pub(crate) fn is_as_expression(node: P<Node>) -> bool {
+pub fn is_as_expression(node: P<Node>) -> bool {
     node.kind() == Kind::AsExpression
 }
 

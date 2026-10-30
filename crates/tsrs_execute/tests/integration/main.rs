@@ -3,4 +3,5 @@ mod build {
     mod buildtask_could_change_resolution_test;
     mod orchestrator_scheduling_test;
 }
+mod embedding_test;
 mod tsctests;
