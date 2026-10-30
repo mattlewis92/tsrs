@@ -193,24 +193,7 @@ impl Program {
             return 0;
         }
         let program = self.p();
-        let files: Vec<P<SourceFile>> = program
-            .get_source_files()
-            .iter()
-            .copied()
-            .filter(|&file| {
-                !file.is_declaration_file()
-                    && !tsrs_ast::is_json_source_file(file)
-                    && snapshot
-                        .file_infos
-                        .load(file.path())
-                        .is_some_and(|info| info.signature == info.version)
-            })
-            .collect();
-        // An emit runs each checker's files one after another; in program order a chunk is mostly one checker's.
-        let files = match program.compiler_checker_pool() {
-            Some(pool) => pool.interleave_by_checker(&files),
-            None => files,
-        };
+        let chunks = self.placeholder_signature_chunks(chunk);
         let stored = std::sync::atomic::AtomicUsize::new(0);
         let write_file =
             |file_name: &str, text: &str, data: &mut WriteFileData| -> Result<(), String> {
@@ -231,14 +214,14 @@ impl Program {
                 }
                 Ok(())
             };
-        for files in files.chunks(chunk.max(1)) {
+        for files in chunks {
             if ctx.err().is_some() {
                 break;
             }
             program.emit(
                 ctx,
                 &EmitOptions {
-                    target_source_files: Some(files.to_vec()),
+                    target_source_files: Some(files),
                     emit_only: EmitOnly::EmitOnlyBuilderSignature,
                     write_file: Some(&write_file),
                     ..Default::default()
@@ -250,6 +233,33 @@ impl Program {
             snapshot.build_info_emit_pending.set(true);
         }
         stored
+    }
+
+    /// tsrs-only: the emits of `compute_placeholder_signatures`, `chunk` files each: the program's source files whose
+    /// signature is still a stand-in, round robin over the checkers that own them
+    /// (`CheckerPoolImpl::interleave_by_checker`). An emit runs each checker's files one after another, and in program
+    /// order a chunk would be mostly one checker's.
+    pub fn placeholder_signature_chunks(&self, chunk: usize) -> Vec<Vec<P<SourceFile>>> {
+        let snapshot = self.snapshot;
+        let program = self.p();
+        let files: Vec<P<SourceFile>> = program
+            .get_source_files()
+            .iter()
+            .copied()
+            .filter(|&file| {
+                !file.is_declaration_file()
+                    && !tsrs_ast::is_json_source_file(file)
+                    && snapshot
+                        .file_infos
+                        .load(file.path())
+                        .is_some_and(|info| info.signature == info.version)
+            })
+            .collect();
+        let files = match program.compiler_checker_pool() {
+            Some(pool) => pool.interleave_by_checker(&files),
+            None => files,
+        };
+        files.chunks(chunk.max(1)).map(<[_]>::to_vec).collect()
     }
 
     /// tsrs-only (watch mode, Go's GC): runs the destructors of a program nothing reads any more and of its

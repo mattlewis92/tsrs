@@ -315,3 +315,44 @@ fn signatures_wait_for_pending_changes() {
     assert_eq!(new.snapshot.changed_files_set.size(), 1);
     assert_eq!(new.compute_placeholder_signatures(&ctx, 3), 0);
 }
+
+// tsrs-only: the job's emits take their files round robin over the checkers, so each chunk of two spans both
+// checkers while both have files left (an emit runs one checker's files one after another).
+#[test]
+fn signature_chunks_span_the_checkers() {
+    let ctx = Context::default();
+    let texts: BTreeMap<&'static str, String> =
+        VARIANTS.iter().map(|&(name, variants)| (name, variants[0].to_string())).collect();
+    let config =
+        r#"{ "compilerOptions": { "noLib": true, "types": [], "noEmit": true, "checkers": 2 } }"#;
+    let files = files_of(config, &texts);
+    let program: &'static Program = Box::leak(Box::new(tsrs_incremental::new_program(
+        compiler_program(&files),
+        None,
+        tsrs_incremental::create_host(compiler_host(&files)),
+        None,
+        false,
+    )))
+    .get();
+    let pool = program.get_program().compiler_checker_pool().expect("built-in pool");
+    let chunks = program.placeholder_signature_chunks(2);
+    let owners: Vec<Vec<usize>> = chunks
+        .iter()
+        .map(|chunk| chunk.iter().map(|&file| pool.checker_of(file).unwrap()).collect())
+        .collect();
+    let mut remaining = [0usize; 2];
+    for &owner in owners.iter().flatten() {
+        remaining[owner] += 1;
+    }
+    assert!(remaining.iter().all(|&count| count > 0), "both checkers own files: {owners:?}");
+    for chunk in &owners {
+        if chunk.len() == 2 && remaining[0] > 0 && remaining[1] > 0 {
+            assert_ne!(chunk[0], chunk[1], "{owners:?}");
+        }
+        for &owner in chunk {
+            remaining[owner] -= 1;
+        }
+    }
+    // The job still stores a signature for every source file.
+    assert_eq!(program.compute_placeholder_signatures(&ctx, 2), VARIANTS.len());
+}
