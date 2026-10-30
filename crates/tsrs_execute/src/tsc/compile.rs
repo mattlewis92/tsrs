@@ -227,6 +227,10 @@ pub(crate) fn get_trace_with_writer_from_sys(
 // compile.go:61
 pub trait Watcher {
     fn do_cycle(&mut self);
+    // tsrs-only: the config the next cycle starts from, for tests.
+    fn config(&self) -> Option<&'static tsrs_tsoptions::ParsedCommandLine> {
+        None
+    }
 }
 
 pub struct CommandLineResult {

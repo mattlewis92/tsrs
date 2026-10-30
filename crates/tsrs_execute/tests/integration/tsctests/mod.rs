@@ -15,6 +15,7 @@
 mod mockwatch;
 mod readablebuildinfo;
 mod sys;
+mod watch_config_test;
 mod watch_test;
 
 use std::fmt::Write as _;

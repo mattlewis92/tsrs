@@ -118,6 +118,11 @@ pub struct Watcher {
     signature_job: Option<(tsrs_core::context::CancelFunc, std::thread::JoinHandle<()>)>,
     config_file_name: String,
     config: P<ParsedCommandLine>,
+    // tsrs-only (Go's GC): the region of `config` when it is one `reload_config` made, and those of the reloaded
+    // configs it replaced, which the programs since the last full build may still use; the next full build frees them
+    // with the program it replaces (`install_program`).
+    config_region: Option<Region>,
+    replaced_config_regions: Vec<Region>,
     compiler_options_from_command_line: P<CompilerOptions>,
     command_line_raw: Option<CompilerOptionsValue>,
     report_diagnostic: DiagnosticReporter<'static>,
@@ -171,6 +176,9 @@ impl tsc::Watcher for Watcher {
     fn do_cycle(&mut self) {
         Watcher::do_cycle(self);
     }
+    fn config(&self) -> Option<&'static ParsedCommandLine> {
+        Some(self.config.get())
+    }
 }
 
 /// Go `createWatcher` + `start`. Without the test harness this blocks, running cycles until the process ends.
@@ -208,6 +216,8 @@ pub(crate) fn run_watcher(
             .map(|f| f.source_file.file_name().to_string())
             .unwrap_or_default(),
         config,
+        config_region: None,
+        replaced_config_regions: Vec::new(),
         compiler_options_from_command_line,
         command_line_raw,
         report_diagnostic,
@@ -733,13 +743,12 @@ impl Watcher {
             if self.config.config_file.is_some()
                 && self.config.wildcard_directories().is_some_and(|w| !w.is_empty())
             {
-                let new_config =
-                    P::new(self.config.reload_file_names_of_parsed_command_line(&*self.sys.fs()));
+                let (new_config, region) = self.reload_config();
                 reloaded_file_names = true;
                 if self.config.file_names() == new_config.file_names() {
                     self.watch_set_dirty = false;
                 }
-                self.config = new_config;
+                self.replace_config(new_config, Some(region));
             } else if !self.config_modified {
                 self.watch_set_dirty = false;
             }
@@ -794,8 +803,8 @@ impl Watcher {
                 && !self.watch_set_dirty
                 && self.config.wildcard_directories().is_some_and(|w| !w.is_empty())
             {
-                self.config =
-                    P::new(self.config.reload_file_names_of_parsed_command_line(&*self.sys.fs()));
+                let (new_config, region) = self.reload_config();
+                self.replace_config(new_config, Some(region));
             }
         }
         for path in &self.config_file_paths {
@@ -961,14 +970,15 @@ impl Watcher {
             // incremental programs are made on this thread (`install_program`).
             unsafe { tsrs_incremental::Program::free_replaced(old_incremental) };
         }
-        let (shared, old_regions) = if full_build {
+        let (shared, old_regions, replaced_configs) = if full_build {
             self.full_build_files = program.get_source_files().to_vec();
             (
                 self.shared_program_data.replace(tsrs_compiler::shared_program_data(program)),
                 std::mem::replace(&mut self.full_build_regions, full_build_regions),
+                std::mem::take(&mut self.replaced_config_regions),
             )
         } else {
-            (None, None)
+            (None, None, Vec::new())
         };
         let dead_files = self.file_regions.take_unreachable(&self.live_files(new));
         let free = move || {
@@ -986,6 +996,9 @@ impl Watcher {
                 // the new full build has its own.
                 unsafe { shared.free() };
             }
+            // The programs that used these configs are freed (above, or by earlier jobs); the new full build uses the
+            // current one.
+            drop(replaced_configs);
             // The programs that referred to these files are freed (above, or by earlier jobs), and nothing that is
             // read again does (`live_files`).
             drop(dead_files);
@@ -1169,8 +1182,29 @@ impl Watcher {
             self.config_modified = true;
         }
         self.replace_content_mapper_project(config_parse_result);
-        self.config = config_parse_result;
+        self.replace_config(config_parse_result, None);
         false
+    }
+
+    // tsrs-only: `reload_file_names_of_parsed_command_line` in a region of its own (`config_region`). Every full build
+    // after a file is added or removed reloads one, which kept the file names (several copies) for the session.
+    fn reload_config(&self) -> (P<ParsedCommandLine>, Region) {
+        let reloaded = self.config.reload_file_names_of_parsed_command_line(&*self.sys.fs());
+        let region = Region::new(4 << 10);
+        let config = {
+            let _scope = region.enter();
+            P::new(reloaded)
+        };
+        (config, region)
+    }
+
+    // `region`: the one `reload_config` made `config` in; `None` for a parsed config, which the content mapper project
+    // refers to and the session keeps.
+    fn replace_config(&mut self, config: P<ParsedCommandLine>, region: Option<Region>) {
+        self.config = config;
+        if let Some(old) = std::mem::replace(&mut self.config_region, region) {
+            self.replaced_config_regions.push(old);
+        }
     }
 
     fn parse_config_file(&mut self) -> Option<P<ParsedCommandLine>> {
