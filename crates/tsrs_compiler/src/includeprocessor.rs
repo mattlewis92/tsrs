@@ -196,18 +196,18 @@ impl FileIncludeData {
         self.processing_diagnostics.push(d);
     }
 
+    // `file_reasons` is Go's `i.fileIncludeReasons[file]`: the collection walk keeps a file's reasons apart until it
+    // finishes (filesparser.rs `reasons_by_data`), so `file_include_reasons` is still empty when a casing conflict is
+    // found.
     pub(crate) fn add_processing_diagnostics_for_file_casing(
         &mut self,
         file: Path,
+        file_reasons: &[P<FileIncludeReason>],
         existing_casing: &str,
         current_casing: &str,
         reason: Option<P<FileIncludeReason>>,
     ) {
-        let already_referenced = self
-            .file_include_reasons
-            .get(&file)
-            .is_some_and(|reasons| reasons.iter().any(|r| r.is_referenced_file()));
-        if !is_referenced_file(reason) && already_referenced {
+        if !is_referenced_file(reason) && file_reasons.iter().any(|r| r.is_referenced_file()) {
             self.add_processing_diagnostic(ProcessingDiagnostic::explaining(IncludeExplainingDiagnostic {
                 file: Some(file),
                 diagnostic_reason: reason,

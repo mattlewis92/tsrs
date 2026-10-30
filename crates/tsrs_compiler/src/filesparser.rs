@@ -1281,6 +1281,7 @@ impl FilesParser {
                                 let checked_name = Arc::clone(checked_name);
                                 include_data.add_processing_diagnostics_for_file_casing(
                                     loader.tasks[task].path.clone(),
+                                    &reasons_by_data[data],
                                     &checked_name,
                                     loader.tasks[task].normalized_file_path.as_ref(),
                                     include_reason,
@@ -1306,6 +1307,7 @@ impl FilesParser {
                                 );
                                 include_data.add_processing_diagnostics_for_file_casing(
                                     p,
+                                    &reasons_by_data[task_data(loader, task_by_ignore_case)],
                                     &n,
                                     loader.tasks[task].normalized_file_path.as_ref(),
                                     include_reason,
