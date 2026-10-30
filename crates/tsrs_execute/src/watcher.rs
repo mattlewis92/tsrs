@@ -105,13 +105,46 @@ impl CompilerHost for WatchCompilerHost {
     }
 }
 
+// tsrs-only: what the programs since a full build share, and a region that owns the processed-file data among it, as
+// the language server's full builds have (tsrs_project memregions.rs `ProgramOwner`). `Program::get_symlink_cache`
+// routes the cache it stores with that data to the data's owner (`enter_owner`); without one it goes to the arena of
+// the thread that first asks, which is never freed, so each full build whose cache was filled kept it.
+struct SharedData {
+    data: tsrs_compiler::SharedProgramData,
+    owner: Region,
+    processed: usize,
+}
+
+impl SharedData {
+    fn new(program: &'static Program) -> SharedData {
+        // `Program` derefs to its shared processed-file data, the address `get_symlink_cache` routes by.
+        let processed = std::ptr::from_ref(&**program).cast::<()>() as usize;
+        let owner = Region::new(4 << 10);
+        owner.adopt_owner(processed);
+        SharedData { data: tsrs_compiler::shared_program_data(program), owner, processed }
+    }
+
+    // Frees the owner, with the symlink cache, once every program that could read the cache is freed, and returns the
+    // data for the caller to free. The owner gives up the data's address before the data is freed: a full build on
+    // another thread that got the address back would otherwise have its cache routed to this region, or its own owner
+    // unregistered with it.
+    fn disown(self) -> tsrs_compiler::SharedProgramData {
+        drop(self.owner);
+        debug_assert!(
+            Region::containing(self.processed).is_none(),
+            "the processed-file data is still owned when it is freed"
+        );
+        self.data
+    }
+}
+
 // Files per declaration emit of `start_signature_job`: what a new cycle may wait for once it cancels the job.
 pub(crate) const SIGNATURE_JOB_CHUNK: usize = 256;
 
 pub struct Watcher {
     sys: &'static dyn System,
     // tsrs-only: what the programs since the last full build share (`install_program`).
-    shared_program_data: Option<tsrs_compiler::SharedProgramData>,
+    shared_program_data: Option<SharedData>,
     // Frees what the last `install_program` replaced, once the cycle has reported (`free_replaced_program`).
     free_replaced: Option<Box<dyn FnOnce() + Send>>,
     // The background computation of the program's placeholder signatures (`start_signature_job`).
@@ -170,6 +203,10 @@ pub struct Watcher {
 impl tsc::Watcher for Watcher {
     fn do_cycle(&mut self) {
         Watcher::do_cycle(self);
+    }
+
+    fn program(&self) -> Option<&'static Program> {
+        self.program?.compiler_program()
     }
 }
 
@@ -964,7 +1001,7 @@ impl Watcher {
         let (shared, old_regions) = if full_build {
             self.full_build_files = program.get_source_files().to_vec();
             (
-                self.shared_program_data.replace(tsrs_compiler::shared_program_data(program)),
+                self.shared_program_data.replace(SharedData::new(program)),
                 std::mem::replace(&mut self.full_build_regions, full_build_regions),
             )
         } else {
@@ -981,6 +1018,7 @@ impl Watcher {
             // The snapshot that kept them is gone, and the new one keeps copies.
             drop(old_snapshot_diagnostics);
             if let Some(shared) = shared {
+                let shared = shared.disown();
                 // SAFETY: every program since the previous full build shared this data, and each was freed when the
                 // next one replaced it (above, for the last one, after the earlier ones: the frees run in order);
                 // the new full build has its own.

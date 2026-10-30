@@ -227,6 +227,11 @@ pub(crate) fn get_trace_with_writer_from_sys(
 // compile.go:61
 pub trait Watcher {
     fn do_cycle(&mut self);
+
+    /// tsrs-only: the compiler program of the last cycle, for tests that check what the watch keeps of it.
+    fn program(&self) -> Option<&'static tsrs_compiler::Program> {
+        None
+    }
 }
 
 pub struct CommandLineResult {
