@@ -7,4 +7,4 @@ pub mod sys;
 pub mod tsc;
 pub mod watcher;
 pub mod watchmanager;
-mod watchmem;
+pub mod watchmem;

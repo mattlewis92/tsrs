@@ -83,13 +83,15 @@ fn first_chunk(text_len: usize) -> usize {
 
 type FreeJob = Box<dyn FnOnce() + Send>;
 
-/// Runs the frees of a watch session on one thread, in the order they were queued: a file region is freed only after
-/// the programs that were replaced before it was found unreachable (they may refer to it). Freeing a large program's
-/// checker regions takes a while (~150 ms on a 9k-file project) and nothing waits for it. A `tsc -b` that is not a
-/// watch session frees each project's program here once it is built (`BuildTask::free_built_program`). The test
-/// harness frees in place, for deterministic runs, and so does a build without threads (WebAssembly). The thread starts
-/// with the first queued free, so a build that frees nothing (an API build, which creates one with its orchestrator)
-/// starts none: in the WebAssembly module, which cannot spawn threads, `-b` panicked creating it.
+/// Runs the frees of a watch session on one thread, in the order they were queued.
+///
+/// A file region is freed only after the programs that were replaced before it was found unreachable (they may refer
+/// to it). Freeing a large program's checker regions takes a while (~150 ms on a 9k-file project) and nothing waits for
+/// it. A `tsc -b` that is not a watch session frees each project's program here once it is built
+/// (`BuildTask::free_built_program`). The test harness frees in place, for deterministic runs, and so does a build
+/// without threads (WebAssembly). The thread starts with the first queued free, so a build that frees nothing (an API
+/// build, which creates one with its orchestrator) starts none: in the WebAssembly module, which cannot spawn threads,
+/// `-b` panicked creating it.
 pub struct Freer {
     in_place: bool,
     tx: std::sync::OnceLock<Mutex<mpsc::Sender<FreeJob>>>,
@@ -97,7 +99,7 @@ pub struct Freer {
 }
 
 impl Freer {
-    pub(crate) fn new(in_place: bool) -> Freer {
+    pub fn new(in_place: bool) -> Freer {
         Freer {
             in_place: in_place || tsrs_core::NO_THREADS,
             tx: std::sync::OnceLock::new(),
@@ -120,25 +122,22 @@ impl Freer {
         })
     }
 
-    /// tsrs-only: once the frees queued so far are done, after each cycle (and the first build):
-    /// - macOS: the allocator gives its freed memory back (`mi_collect(true)`), on every worker-pool thread and here.
-    ///   mimalloc keeps much of what a cycle freed resident there (after a few full rebuilds of vscode, its
-    ///   heap stood ~1 GB above the initial build), and purging at once on every free slows the cycles
-    ///   themselves (`MIMALLOC_PURGE_DELAY=0`: the hub edit 1.3 -> 2.0 s). The pool's threads matter as much
-    ///   as this one: what they allocated during the cycle is freed here, from another thread, and such a
-    ///   block stays allocated in its page (unpurgeable) until the owning thread collects
-    ///   (notes/watch-macos.md, "memory").
-    pub(crate) fn after_cycle(&self) {
+    /// tsrs-only: once the frees queued so far are done, after each cycle (and the first build), the allocator gives
+    /// its freed memory back (`mi_collect(true)`), on every worker-pool thread and here. mimalloc keeps much of what a
+    /// cycle freed resident (after a few full rebuilds of vscode on macOS, its heap stood ~1 GB above the initial
+    /// build), and purging at once on every free slows the cycles themselves (`MIMALLOC_PURGE_DELAY=0`: the hub edit
+    /// 1.3 -> 2.0 s). The pool's threads matter as much as this one: what they allocated during the cycle is freed
+    /// here, from another thread, and such a block stays allocated in its page (unpurgeable) until the owning thread
+    /// collects (notes/watch-macos.md, "memory"). That is how mimalloc frees across threads on every platform, not
+    /// only on macOS (notes/watch-memory.md, "Linux").
+    pub fn after_cycle(&self) {
         self.run(|| {
-            #[cfg(target_os = "macos")]
-            {
-                tsrs_compiler::worker_pool().broadcast(|_| tsrs_core::memsplit::heap_collect(true));
-                tsrs_core::memsplit::heap_collect(true);
-            }
+            tsrs_compiler::worker_pool().broadcast(|_| tsrs_core::memsplit::heap_collect(true));
+            tsrs_core::memsplit::heap_collect(true);
         });
     }
 
-    pub(crate) fn run(&self, job: impl FnOnce() + Send + 'static) {
+    pub fn run(&self, job: impl FnOnce() + Send + 'static) {
         if self.in_place {
             job();
             return;

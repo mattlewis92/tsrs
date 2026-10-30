@@ -98,3 +98,14 @@ ran out (poisoned memory is never reused), and the tsctests pass lists match the
 Tried and dropped: carving file regions from slabs of their own (a third thread-local slab pool), on the theory
 that file regions sharing slabs with checker and emit regions pin them. No measurable change: what pinned slabs was
 the threads' own references (above).
+
+## Linux: the post-cycle collect
+
+`Freer::after_cycle` collected the allocator after each cycle on macOS only (notes/watch-macos.md, "memory"). The
+cause it addresses is not macOS's: a block freed by the free thread stays in its page until the thread that allocated
+it collects, and the worker-pool threads sit idle between cycles on Linux too. An embedder's port of this watcher
+(the same `Freer`, a small test project with one file edited per cycle, debug build on a Linux CI runner) measured
+700 cycles with and without the collect: resident memory went from 171 MiB to 779-906 MiB by cycles 300-699 without it
+(least squares 230 KiB a cycle), and stayed at 116-153 MiB with it (4 KiB a cycle). Live data (the reservation in use
+plus the allocator's live bytes, from a counting global allocator) was 197-201 MiB in both runs. The collect now runs
+on every platform.

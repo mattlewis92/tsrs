@@ -3,4 +3,6 @@ mod build {
     mod buildtask_could_change_resolution_test;
     mod orchestrator_scheduling_test;
 }
+mod isolated;
 mod tsctests;
+mod watchmem_test;
