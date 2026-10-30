@@ -50,4 +50,10 @@ impl<T: Hash + Eq + Clone> SyncSet<T> {
     pub fn keys(&self) -> Vec<T> {
         self.m.keys()
     }
+
+    /// tsrs-only: the keys, moved out, leaving this set empty (`SyncMap::take`).
+    #[must_use]
+    pub fn take(&self) -> SyncSet<T> {
+        SyncSet { m: self.m.take() }
+    }
 }

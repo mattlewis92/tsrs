@@ -937,13 +937,23 @@ impl Watcher {
         let new = {
             // The diagnostics the snapshot recomputes for the new program (`repopulate_diagnostics_of_file`).
             let _route = snapshot_diagnostics.as_ref().map(Region::route_diagnostics);
-            tsrs_incremental::new_program(
-                program,
-                self.program,
-                tsrs_incremental::create_host(host),
-                Some(std::time::Instant::now),
-                self.testing.is_some(),
-            )
+            let host = tsrs_incremental::create_host(host);
+            match self.program.filter(|_| self.testing.is_none()) {
+                // The old program is freed below, unread.
+                Some(old) => tsrs_incremental::new_program_replacing(
+                    program,
+                    old,
+                    host,
+                    Some(std::time::Instant::now),
+                ),
+                None => tsrs_incremental::new_program(
+                    program,
+                    self.program,
+                    host,
+                    Some(std::time::Instant::now),
+                    self.testing.is_some(),
+                ),
+            }
         };
         if let Some(region) = &snapshot_diagnostics {
             let _scope = region.enter();

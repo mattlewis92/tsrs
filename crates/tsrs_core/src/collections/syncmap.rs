@@ -177,4 +177,20 @@ impl<K: Hash + Eq + Clone, V: Clone> SyncMap<K, V> {
         }
         clone
     }
+
+    /// tsrs-only: the entries, moved out shard by shard, leaving this map empty. Unlike `clone_map`, its cost does
+    /// not depend on the number of entries.
+    #[must_use]
+    pub fn take(&self) -> SyncMap<K, V> {
+        let taken = SyncMap::default();
+        for (i, group) in self.shards.iter().enumerate() {
+            if let Some(group) = group.get() {
+                let moved = Box::new(std::array::from_fn(|index| {
+                    RwLock::new(std::mem::take(&mut *group[index].write().unwrap()))
+                }));
+                assert!(taken.shards[i].set(moved).is_ok());
+            }
+        }
+        taken
+    }
 }

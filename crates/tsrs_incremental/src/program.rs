@@ -16,7 +16,7 @@ use crate::emit::{
 };
 use crate::emitfileshandler::emit_files;
 use crate::host::Host;
-use crate::programtosnapshot::program_to_snapshot;
+use crate::programtosnapshot::{program_to_snapshot, program_to_snapshot_replacing};
 use crate::snapshot::{DiagnosticsOrBuildInfoDiagnosticsWithFileName, Snapshot};
 use crate::snapshottobuildinfo::snapshot_to_build_info;
 
@@ -55,6 +55,31 @@ pub fn new_program(
     testing: bool,
 ) -> P<Program> {
     let snapshot = program_to_snapshot(program, old_program, testing);
+    with_snapshot(program, snapshot, old_program, host, nested_emit_now, testing)
+}
+
+/// tsrs-only: `new_program` for a program that replaces `old_program`, which is only freed afterwards.
+///
+/// The old program is not read again (`Program::free_replaced`): its snapshot's per-file state moves to the new
+/// program's (`program_to_snapshot_replacing`). The test harness, which reads the old snapshot, takes `new_program`.
+pub fn new_program_replacing(
+    program: &'static CompilerProgram,
+    old_program: P<Program>,
+    host: Box<dyn Host + Send + Sync>,
+    nested_emit_now: Option<fn() -> Instant>,
+) -> P<Program> {
+    let snapshot = program_to_snapshot_replacing(program, old_program);
+    with_snapshot(program, snapshot, Some(old_program), host, nested_emit_now, false)
+}
+
+fn with_snapshot(
+    program: &'static CompilerProgram,
+    snapshot: P<Snapshot>,
+    old_program: Option<P<Program>>,
+    host: Box<dyn Host + Send + Sync>,
+    nested_emit_now: Option<fn() -> Instant>,
+    testing: bool,
+) -> P<Program> {
     let testing_data = if testing {
         let testing_data = TestingData {
             old_snapshot: old_program.map(|p| p.snapshot),

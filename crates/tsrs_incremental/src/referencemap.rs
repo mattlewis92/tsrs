@@ -101,6 +101,16 @@ impl ReferenceMap {
         self.references.load(path)
     }
 
+    pub(crate) fn delete_references(&self, path: &Path) {
+        self.references.delete(path);
+    }
+
+    /// tsrs-only: the references, moved out (`SyncMap::take`), without the inverted map built from them, which the
+    /// next query builds from the references as they are then.
+    pub(crate) fn take(&self) -> ReferenceMap {
+        ReferenceMap { references: self.references.take(), ..ReferenceMap::default() }
+    }
+
     // referencemap.go:27
     pub(crate) fn get_paths_with_references(&self) -> Vec<Path> {
         self.references.keys()

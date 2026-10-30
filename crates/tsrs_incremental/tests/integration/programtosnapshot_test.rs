@@ -432,3 +432,168 @@ fn global_deletion_preserves_skipped_default_library_diagnostics() {
         assert_eq!(current.get().get_semantic_diagnostics(&ctx, None).len(), 0, "{config}");
     }
 }
+
+// tsrs-only: new_program_replacing takes the replaced snapshot's per-file state over when the new program is
+// reuse_program's of the old one. Its snapshot must be the one new_program gives (the debug build also asserts that
+// in full); these compare what a watch reads of it.
+
+fn checked(files: &[(&'static str, &'static str)]) -> (&'static CompilerProgram, P<Program>) {
+    let program = compiler_program(files);
+    let incremental = incremental(program, None);
+    incremental.get().get_semantic_diagnostics(&Context::default(), None);
+    (program, incremental)
+}
+
+fn reused(
+    old_program: &'static CompilerProgram,
+    name: &'static str,
+    edited: &[(&'static str, &'static str)],
+) -> &'static CompilerProgram {
+    let (reused, _, ok) =
+        old_program.reuse_program(&Path::from(name), compiler_host(edited), None, None);
+    assert!(ok, "{name}");
+    reused.unwrap()
+}
+
+// Per file: whether the snapshot has its semantic diagnostics, then their codes (which checks the files without).
+fn semantic_states(program: P<Program>) -> Vec<(Path, bool, Vec<i32>)> {
+    let snapshot = program.snapshot;
+    let mut paths = snapshot.file_infos.keys();
+    paths.sort();
+    let cached: Vec<bool> = paths
+        .iter()
+        .map(|path| snapshot.semantic_diagnostics_per_file.load(path).is_some())
+        .collect();
+    paths
+        .into_iter()
+        .zip(cached)
+        .map(|(path, cached)| {
+            let file = program.program.unwrap().get_source_file_by_path(&path);
+            let codes = program
+                .get()
+                .get_semantic_diagnostics(&Context::default(), file)
+                .iter()
+                .map(|d| d.code())
+                .collect();
+            (path, cached, codes)
+        })
+        .collect()
+}
+
+fn assert_replacing_matches(
+    files: &[(&'static str, &'static str)],
+    edits: &[(&'static str, &'static str)],
+    check_between: bool,
+) {
+    let run = |replace: bool| {
+        let (mut program, mut state) = checked(files);
+        let mut current: Vec<(&'static str, &'static str)> = files.to_vec();
+        for &(name, text) in edits {
+            current.retain(|&(n, _)| n != name);
+            current.push((name, text));
+            let next = reused(program, name, &current);
+            let old = state;
+            state = if replace {
+                tsrs_incremental::new_program_replacing(
+                    next,
+                    old,
+                    tsrs_incremental::create_host(compiler_host(&FILES)),
+                    None,
+                )
+            } else {
+                incremental(next, Some(old))
+            };
+            if replace {
+                assert_eq!(old.snapshot.file_infos.size(), 0, "the old state was taken over");
+            }
+            if check_between {
+                state.get().get_semantic_diagnostics(&Context::default(), None);
+            }
+            program = next;
+        }
+        (file_states(&state), changed_files(&state), semantic_states(state))
+    };
+    assert_eq!(run(true), run(false));
+}
+
+#[test]
+fn a_replacing_snapshot_of_a_reused_program_is_the_full_one() {
+    let with_error = with(&[("/src/err.ts", Some("export const err: string = 1;\n"))]);
+    for (name, text) in [
+        ("/src/a.ts", "export const a = 1;\nconst local = 2;\n"),
+        ("/src/err.ts", "export const err: string = 2;\n"),
+        (
+            "/src/aug.ts",
+            "import './a';\ndeclare module './a' { interface I { y: string } }\nexport {};\n",
+        ),
+        ("/src/g.ts", "declare var g: string;\n"),
+    ] {
+        assert_replacing_matches(&with_error, &[(name, text)], true);
+    }
+}
+
+// Two edits without a check in between: the second program's old state still has the first edit in its change
+// set, whose diagnostics are not copied.
+#[test]
+fn a_replacing_snapshot_keeps_the_pending_change_set() {
+    let with_error = with(&[("/src/err.ts", Some("export const err: string = 1;\n"))]);
+    assert_replacing_matches(
+        &with_error,
+        &[
+            ("/src/err.ts", "export const err: string = 2;\n"),
+            ("/src/a.ts", "export const a = 1;\nconst local = 2;\n"),
+        ],
+        false,
+    );
+}
+
+// A program that is not reuse_program's of the old one takes the full computation, leaving the old state intact.
+#[test]
+fn a_replacing_snapshot_of_a_fresh_program_computes_every_file() {
+    let (_, old) = checked(&FILES);
+    let edited = with(&[("/src/a.ts", Some("export const a = 1;\nconst local = 2;\n"))]);
+    let fresh = compiler_program(&edited);
+    let size = old.snapshot.file_infos.size();
+    let new = tsrs_incremental::new_program_replacing(
+        fresh,
+        old,
+        tsrs_incremental::create_host(compiler_host(&FILES)),
+        None,
+    );
+    assert_eq!(old.snapshot.file_infos.size(), size);
+    assert_eq!(file_states(&new), file_states(&incremental(fresh, None)));
+    assert_eq!(changed_files(&new), ["/src/a.ts"]);
+}
+
+// An unchanged file in the old change set that has diagnostics: the full computation copies none of them, and a
+// snapshot that took the old state over drops them.
+#[test]
+fn a_replacing_snapshot_drops_the_diagnostics_of_an_unchanged_file_in_the_change_set() {
+    let with_error = with(&[("/src/err.ts", Some("export const err: string = 1;\n"))]);
+    let edited = with(&[
+        ("/src/err.ts", Some("export const err: string = 1;\n")),
+        ("/src/a.ts", Some("export const a = 1;\nconst local = 2;\n")),
+    ]);
+    let err = Path::from("/src/err.ts");
+    let run = |replace: bool| {
+        let (program, old) = checked(&with_error);
+        assert!(old.snapshot.semantic_diagnostics_per_file.load(&err).is_some());
+        old.snapshot.changed_files_set.add(err.clone());
+        let next = reused(program, "/src/a.ts", &edited);
+        let new = if replace {
+            tsrs_incremental::new_program_replacing(
+                next,
+                old,
+                tsrs_incremental::create_host(compiler_host(&FILES)),
+                None,
+            )
+        } else {
+            incremental(next, Some(old))
+        };
+        let cached = new.snapshot.semantic_diagnostics_per_file.load(&err).is_some();
+        (file_states(&new), changed_files(&new), cached)
+    };
+    let full = run(false);
+    assert!(!full.2);
+    assert_eq!(run(true), full);
+}

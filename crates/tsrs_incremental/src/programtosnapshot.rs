@@ -22,23 +22,146 @@ pub fn program_to_snapshot(
     old_program: Option<P<Program>>,
     hash_with_text: bool,
 ) -> P<Snapshot> {
+    to_snapshot(program, old_program, hash_with_text, false)
+}
+
+/// tsrs-only: `program_to_snapshot` for a program that replaces `old_program`, whose snapshot is not read again (a
+/// watch frees it, `Program::free_replaced`). When `program` is `reuse_program`'s of the old state's program, under
+/// the same options and with the same files, the new snapshot takes the old one's per-file state over and computes
+/// only the files `reuse_program` parsed again, leaving the old snapshot's maps empty; the snapshot is the one
+/// `program_to_snapshot` gives. A one-file watch cycle on a 68k-file program stored every file's state again,
+/// ~50–100 ms of a ~3 s cycle.
+pub fn program_to_snapshot_replacing(
+    program: &'static CompilerProgram,
+    old_program: P<Program>,
+) -> P<Snapshot> {
+    if !can_take_over(program, old_program) {
+        return program_to_snapshot(program, Some(old_program), false);
+    }
+    #[cfg(debug_assertions)]
+    let expected = program_to_snapshot(program, Some(old_program), false);
+    let snapshot = to_snapshot(program, Some(old_program), false, true);
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(
+        snapshot_state(&snapshot),
+        snapshot_state(&expected),
+        "the snapshot taken over from the replaced one is not the one program_to_snapshot gives"
+    );
+    snapshot
+}
+
+// Whether `program_to_snapshot_replacing` can take the old snapshot's state over: every file the new program did
+// not parse again keeps its old state, which holds when `program` is `reuse_program`'s of the old state's program
+// (same files in the same order, the same module resolution for the others) under the same options. Composite
+// projects' emit signatures and test hashes take the full computation.
+fn can_take_over(program: &'static CompilerProgram, old_program: P<Program>) -> bool {
+    let old = old_program.snapshot;
+    old_program.program.is_some_and(|old_compiler_program| {
+        !std::ptr::eq(old_compiler_program, program)
+            && program.is_reuse_of(old_compiler_program)
+            && same_file_paths(old_compiler_program, program, old.file_infos.size())
+    }) && !old.hash_with_text
+        && old.options.get().is_some_and(|options| options == program.options())
+        && !program.options().composite.is_true()
+}
+
+// Everything a snapshot holds per file and per program, for the debug check of `program_to_snapshot_replacing`.
+#[cfg(debug_assertions)]
+fn snapshot_state(snapshot: &Snapshot) -> String {
+    fn sorted<K: Ord + std::fmt::Debug, V: std::fmt::Debug>(entries: Vec<(K, V)>) -> String {
+        let mut entries = entries;
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        format!("{entries:?}")
+    }
+    let diagnostics = |map: &SyncMap<Path, DiagnosticsCache>| {
+        sorted(
+            map.to_map()
+                .into_iter()
+                .map(|(path, cache)| {
+                    let list: Option<Vec<_>> = cache.diagnostics().map(|list| {
+                        list.iter()
+                            .map(|d| (d.code(), d.pos(), d.end(), d.message_text().to_string()))
+                            .collect()
+                    });
+                    (path, format!("{list:?} {:?}", cache.build_info_diagnostics))
+                })
+                .collect(),
+        )
+    };
+    let references = sorted(
+        snapshot
+            .referenced_map
+            .get_paths_with_references()
+            .into_iter()
+            .map(|path| {
+                let mut refs: Vec<String> = snapshot
+                    .referenced_map
+                    .get_references(&path)
+                    .map(|refs| refs.iter().map(ToString::to_string).collect())
+                    .unwrap_or_default();
+                refs.sort();
+                (path, refs)
+            })
+            .collect(),
+    );
+    let mut changed = snapshot.changed_files_set.keys();
+    changed.sort();
+    format!(
+        "file_infos {}\nreferences {references}\nsemantic {}\nemit {}\nchanged {changed:?}\npending emit {}\n\
+         emit signatures {}\nflags {:?}",
+        sorted(snapshot.file_infos.to_map().into_iter().collect()),
+        diagnostics(&snapshot.semantic_diagnostics_per_file),
+        diagnostics(&snapshot.emit_diagnostics_per_file),
+        sorted(snapshot.affected_files_pending_emit.to_map().into_iter().collect()),
+        sorted(snapshot.emit_signatures.to_map().into_iter().collect()),
+        (
+            snapshot.build_info_emit_pending.get(),
+            snapshot.check_pending.get(),
+            snapshot.has_errors_from_old_state.get(),
+            snapshot.has_semantic_errors_from_old_state.get(),
+            snapshot.package_jsons_from_old_state.borrow().clone(),
+            snapshot.missing_package_jsons_from_old_state.borrow().clone(),
+            snapshot.canonical_check_signature.get(),
+            &snapshot.file_order,
+        ),
+    )
+}
+
+fn to_snapshot(
+    program: &'static CompilerProgram,
+    old_program: Option<P<Program>>,
+    hash_with_text: bool,
+    take_over: bool,
+) -> P<Snapshot> {
     if let Some(old_program) = old_program
         && old_program.program.is_some_and(|p| std::ptr::eq(p, program))
     {
         return old_program.snapshot;
     }
+    let file_order = program.get_source_files().iter().map(|file| file.path().clone()).collect();
     // Recycled: a watch session frees the snapshot it replaces (`Program::drop_replaced`).
-    let snapshot = P::new_recycled(Snapshot {
-        hash_with_text,
-        file_order: program.get_source_files().iter().map(|file| file.path().clone()).collect(),
-        ..Default::default()
-    });
+    let snapshot = match old_program.filter(|_| take_over).map(|old_program| old_program.snapshot) {
+        Some(old) => P::new_recycled(Snapshot {
+            file_infos: old.file_infos.take(),
+            referenced_map: old.referenced_map.take(),
+            semantic_diagnostics_per_file: old.semantic_diagnostics_per_file.take(),
+            emit_diagnostics_per_file: old.emit_diagnostics_per_file.take(),
+            changed_files_set: old.changed_files_set.take(),
+            affected_files_pending_emit: old.affected_files_pending_emit.take(),
+            emit_signatures: old.emit_signatures.take(),
+            file_order,
+            hash_with_text,
+            ..Default::default()
+        }),
+        None => P::new_recycled(Snapshot { file_order, hash_with_text, ..Default::default() }),
+    };
     snapshot.options.set(Some(program.options()));
     snapshot.check_pending.set(program.options().no_check.is_true());
     let mut to = ToProgramSnapshot {
         program,
         old_program,
         snapshot,
+        taken_over: take_over && old_program.is_some(),
         global_file_removed: false,
         has_deleted_files: false,
         global_scope_lost: false,
@@ -69,6 +192,9 @@ struct ToProgramSnapshot {
     program: &'static CompilerProgram,
     old_program: Option<P<Program>>,
     snapshot: P<Snapshot>,
+    // The snapshot holds the old one's per-file state (`program_to_snapshot_replacing`): the old state of a file is
+    // read from it, and only the files the program parsed again are computed.
+    taken_over: bool,
     global_file_removed: bool,
     // Files of the old state that the new program does not have (compute_program_file_changes).
     has_deleted_files: bool,
@@ -101,19 +227,32 @@ impl ToProgramSnapshot {
                     .clone_from(&old.latest_changed_dts_file.borrow());
             }
             self.snapshot.build_info_emit_pending.set(old.build_info_emit_pending.get());
+            // A snapshot that took the old one's state over holds both sets already: it drops the paths the program
+            // lacks instead of copying the others.
+            let from = if self.taken_over { self.snapshot } else { old };
             // Copy old snapshot's changed files set
-            old.changed_files_set.range(|key| {
+            from.changed_files_set.range(|key| {
                 if self.program.get_source_file_by_path(key).is_some() {
-                    self.snapshot.changed_files_set.add(key.clone());
+                    if !self.taken_over {
+                        self.snapshot.changed_files_set.add(key.clone());
+                    }
                 } else {
+                    if self.taken_over {
+                        self.snapshot.changed_files_set.delete(key);
+                    }
                     self.snapshot.build_info_emit_pending.set(true);
                 }
                 true
             });
-            old.affected_files_pending_emit.range(|key, &emit_kind| {
+            from.affected_files_pending_emit.range(|key, &emit_kind| {
                 if self.program.get_source_file_by_path(key).is_some() {
-                    self.snapshot.affected_files_pending_emit.store(key.clone(), emit_kind);
+                    if !self.taken_over {
+                        self.snapshot.affected_files_pending_emit.store(key.clone(), emit_kind);
+                    }
                 } else {
+                    if self.taken_over {
+                        self.snapshot.affected_files_pending_emit.delete(key);
+                    }
                     self.snapshot.build_info_emit_pending.set(true);
                 }
                 true
@@ -162,7 +301,24 @@ impl ToProgramSnapshot {
             && self.snapshot.options().skip_default_lib_check.is_true()
                 == old.unwrap().options().skip_default_lib_check.is_true();
 
-        let files = self.program.get_source_files();
+        let all_files = self.program.get_source_files();
+        // The per-file state of the old snapshot, which a snapshot that took it over holds.
+        let state = if self.taken_over { Some(self.snapshot) } else { old };
+        // The files computed: every file, or, with the old state taken over, those the program parsed again (the
+        // others keep their state; `can_take_over` checked that the files are the old program's, in its order).
+        let reparsed: Vec<P<SourceFile>>;
+        let files: &[P<SourceFile>] = match self.old_program.and_then(|p| p.program) {
+            Some(old_program) if self.taken_over => {
+                reparsed = all_files
+                    .iter()
+                    .zip(old_program.get_source_files())
+                    .filter(|(file, old_file)| file != old_file)
+                    .map(|(&file, _)| file)
+                    .collect();
+                &reparsed
+            }
+            _ => all_files,
+        };
         let old_options = old.map(|old| old.options());
         let ambient_module_files_by_checker = AmbientModuleFilesByChecker::default();
         // Files of the old state that the new program does not have.
@@ -205,7 +361,7 @@ impl ToProgramSnapshot {
                        checker_references: Option<CheckerReferences>|
          -> (FileInfo, Option<std::sync::Arc<RefSet>>, FileChange) {
             // programtosnapshot.go:94
-            let old_file_info = old.and_then(|old| old.file_infos.load(file.path()));
+            let old_file_info = state.and_then(|state| state.file_infos.load(file.path()));
             let version = match reused_version(old_compiler_program, old_file_info.as_ref(), file) {
                 Some(version) => version,
                 None if !file.content_mapper().is_empty() => self.snapshot.compute_hash(&format!(
@@ -219,7 +375,8 @@ impl ToProgramSnapshot {
                 self.program.get_source_file_meta_data(file.path()).implied_node_format;
             let affects_global_scope = file_affects_global_scope(file);
             let mut signature = String::new();
-            let old_references = old.and_then(|old| old.referenced_map.get_references(file.path()));
+            let old_references =
+                state.and_then(|state| state.referenced_map.get_references(file.path()));
             let new_references = if keeps_references(file) {
                 old_references.clone()
             } else {
@@ -243,7 +400,7 @@ impl ToProgramSnapshot {
                 semantic_diagnostics: None,
                 emit_signature: None,
             };
-            if let Some(old) = old {
+            if let Some(state) = state {
                 if let Some(old_file_info) = old_file_info {
                     change.global_scope_lost =
                         old_file_info.affects_global_scope && !affects_global_scope;
@@ -276,7 +433,8 @@ impl ToProgramSnapshot {
                 }
                 // Only this file's own entry in the change set matters, and the parallel phase does not write the set.
                 if !change.add_to_change_set && !self.snapshot.changed_files_set.has(file.path()) {
-                    if let Some(emit_diagnostics) = old.emit_diagnostics_per_file.load(file.path())
+                    if let Some(emit_diagnostics) =
+                        state.emit_diagnostics_per_file.load(file.path())
                     {
                         change.emit_diagnostics = Some(repopulate_diagnostics_of_file(
                             &emit_diagnostics,
@@ -291,7 +449,7 @@ impl ToProgramSnapshot {
                     {
                         // Unchanged file copy diagnostics
                         if let Some(diagnostics) =
-                            old.semantic_diagnostics_per_file.load(file.path())
+                            state.semantic_diagnostics_per_file.load(file.path())
                         {
                             change.semantic_diagnostics = Some(repopulate_diagnostics_of_file(
                                 &diagnostics,
@@ -302,7 +460,7 @@ impl ToProgramSnapshot {
                     }
                 }
                 if can_copy_emit_signatures
-                    && let Some(old_emit_signature) = old.emit_signatures.load(file.path())
+                    && let Some(old_emit_signature) = state.emit_signatures.load(file.path())
                 {
                     change.emit_signature = Some(
                         old_emit_signature
@@ -368,7 +526,7 @@ impl ToProgramSnapshot {
         let canonical_diagnostics = self.program.uses_canonical_diagnostics();
         if canonical_diagnostics {
             let mut hash = xxhash_rust::xxh3::Xxh3::new();
-            for &file in files {
+            for &file in all_files {
                 let slot = self.program.tsgo_default_check_slot(file);
                 hash.update(&slot.map_or(u32::MAX, |(checker, _)| checker).to_le_bytes());
             }
@@ -409,6 +567,12 @@ impl ToProgramSnapshot {
                             change.add_to_change_set && declares_interface_before_or_after(file)
                         })
                 });
+        if self.taken_over {
+            self.keep_unchanged_files_state(files, refresh_interface_diagnostics);
+        }
+        // A snapshot that took the old state over holds the computed files' old entries, which the new state
+        // replaces or, where it has none, removes.
+        let taken_over = self.taken_over;
         for (&file, (info, new_references, mut change)) in files.iter().zip(results) {
             if refresh_interface_diagnostics
                 && change.semantic_diagnostics.is_some()
@@ -417,28 +581,45 @@ impl ToProgramSnapshot {
             {
                 change.semantic_diagnostics = None;
             }
-            if let Some(new_references) = new_references {
-                self.snapshot
+            match new_references {
+                Some(new_references) => self
+                    .snapshot
                     .referenced_map
-                    .store_shared_references(file.path().clone(), new_references);
+                    .store_shared_references(file.path().clone(), new_references),
+                None if taken_over => self.snapshot.referenced_map.delete_references(file.path()),
+                None => {}
             }
             if old.is_some() {
                 self.global_scope_lost |= change.global_scope_lost;
                 if change.add_to_change_set {
                     self.snapshot.add_file_to_change_set(file.path().clone());
                 }
-                if let Some(emit_diagnostics) = change.emit_diagnostics {
-                    self.snapshot
+                match change.emit_diagnostics {
+                    Some(emit_diagnostics) => self
+                        .snapshot
                         .emit_diagnostics_per_file
-                        .store(file.path().clone(), emit_diagnostics);
+                        .store(file.path().clone(), emit_diagnostics),
+                    None if taken_over => {
+                        self.snapshot.emit_diagnostics_per_file.delete(file.path());
+                    }
+                    None => {}
                 }
-                if let Some(diagnostics) = change.semantic_diagnostics {
-                    self.snapshot
+                match change.semantic_diagnostics {
+                    Some(diagnostics) => self
+                        .snapshot
                         .semantic_diagnostics_per_file
-                        .store(file.path().clone(), diagnostics);
+                        .store(file.path().clone(), diagnostics),
+                    None if taken_over => {
+                        self.snapshot.semantic_diagnostics_per_file.delete(file.path());
+                    }
+                    None => {}
                 }
-                if let Some(emit_signature) = change.emit_signature {
-                    self.snapshot.emit_signatures.store(file.path().clone(), emit_signature);
+                match change.emit_signature {
+                    Some(emit_signature) => {
+                        self.snapshot.emit_signatures.store(file.path().clone(), emit_signature);
+                    }
+                    None if taken_over => self.snapshot.emit_signatures.delete(file.path()),
+                    None => {}
                 }
             } else {
                 self.snapshot.add_file_to_affected_files_pending_emit(
@@ -447,6 +628,51 @@ impl ToProgramSnapshot {
                 );
             }
             self.snapshot.file_infos.store(file.path().clone(), info);
+        }
+    }
+
+    // With the old state taken over, what the full computation does to the files the program did not parse again,
+    // whose file infos and references stay as they were: it copies no diagnostics of a file in the change set,
+    // repopulates the message chains that need it (`repopulate_diagnostics_of_file`), and a refresh of interface
+    // diagnostics drops those of the checked files that declare an interface.
+    fn keep_unchanged_files_state(
+        &self,
+        computed: &[P<SourceFile>],
+        refresh_interface_diagnostics: bool,
+    ) {
+        let computed: rustc_hash::FxHashSet<Path> =
+            computed.iter().map(|file| file.path().clone()).collect();
+        let snapshot = self.snapshot;
+        for path in snapshot.changed_files_set.keys() {
+            if !computed.contains(&path) {
+                snapshot.emit_diagnostics_per_file.delete(&path);
+                snapshot.semantic_diagnostics_per_file.delete(&path);
+            }
+        }
+        for map in [&snapshot.emit_diagnostics_per_file, &snapshot.semantic_diagnostics_per_file] {
+            map.range(|path, diagnostics| {
+                if !computed.contains(path)
+                    && diagnostics.diagnostics().is_some_and(|list| !list.is_empty())
+                    && let Some(file) = self.program.get_source_file_by_path(path)
+                {
+                    let repopulated =
+                        repopulate_diagnostics_of_file(diagnostics, self.program, file);
+                    if !Arc::ptr_eq(&repopulated, diagnostics) {
+                        map.store(path.clone(), repopulated);
+                    }
+                }
+                true
+            });
+        }
+        if refresh_interface_diagnostics {
+            for &file in self.program.get_source_files() {
+                if !computed.contains(file.path())
+                    && !self.program.skip_type_checking(file, false)
+                    && contains_interface_declaration(file.as_node())
+                {
+                    snapshot.semantic_diagnostics_per_file.delete(file.path());
+                }
+            }
         }
     }
 

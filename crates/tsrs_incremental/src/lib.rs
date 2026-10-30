@@ -22,5 +22,6 @@ pub use incremental::{
 };
 pub use program::{
     Program, SemanticDiagnosticsState, SignatureUpdateKind, TestingData, new_program,
+    new_program_replacing,
 };
 pub use snapshot::{FileEmitKind, FileInfo, compute_hash, get_file_emit_kind};
