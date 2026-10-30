@@ -432,3 +432,54 @@ fn global_deletion_preserves_skipped_default_library_diagnostics() {
         assert_eq!(current.get().get_semantic_diagnostics(&ctx, None).len(), 0, "{config}");
     }
 }
+
+// get_referenced_by answers the first queries by testing every stored set and later ones from an inverted index
+// built by part (each reference set's own paths, and each shared ambient part once). Both answer as testing each
+// file's set does, for the program's files and for paths no file references; the fixture has split sets, two files
+// that declare ambient modules (each one's set leaves itself out of the shared part), and a global script.
+#[test]
+fn referenced_by_answers_from_the_index_as_from_the_sets() {
+    let files =
+        with(&[("/src/n.d.ts", Some("declare module \"n\" { export const y: number; }\n"))]);
+    let program = incremental(compiler_program(&files), None);
+    let map = &program.snapshot.referenced_map;
+    let mut queried: Vec<Path> = program.snapshot.file_infos.keys();
+    queried.push(Path::from("/src/missing.ts"));
+    queried.sort();
+    let expected = |path: &Path| {
+        let mut files: Vec<Path> = program
+            .snapshot
+            .file_infos
+            .keys()
+            .into_iter()
+            .filter(|file| {
+                map.get_references(file).is_some_and(|refs| refs.iter().any(|r| r == path))
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    for round in 0..3 {
+        for path in &queried {
+            let mut files = map.get_referenced_by(path);
+            files.sort();
+            assert_eq!(files, expected(path), "{path} in round {round}");
+        }
+    }
+    // Every file references the ambient module's file through the shared part, except that file itself.
+    let mut ambient_users: Vec<String> =
+        map.get_referenced_by(&Path::from("/src/m.d.ts")).iter().map(ToString::to_string).collect();
+    ambient_users.sort();
+    assert_eq!(
+        ambient_users,
+        [
+            "/src/a.ts",
+            "/src/aug.ts",
+            "/src/b.ts",
+            "/src/c.ts",
+            "/src/d.ts",
+            "/src/g.ts",
+            "/src/n.d.ts"
+        ]
+    );
+}

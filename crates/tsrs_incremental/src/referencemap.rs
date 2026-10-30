@@ -80,15 +80,71 @@ pub struct ReferenceMap {
     // Go builds `referencedBy` once (`sync.Once`), from the references stored at the first query. Here that
     // snapshot is `groups`: the files grouped by the reference set they share (files read from a tsbuildinfo
     // share one set per id list). The first `SCAN_QUERIES` queries test each distinct set for the path; after
-    // that the inverted map is built from the same snapshot. Either way the answer is the one Go's map gives.
-    // A leaf edit asks once or twice, and inverting the ~15 M references of the 38k-file codebase costs ~1 s.
+    // that the inverted map is built from the same snapshot (`ReferencedByIndex`). Either way the answer is the
+    // one Go's map gives. A leaf edit asks once or twice; a change of a file's declarations walks its referencers
+    // and asks hundreds of times, which scanning ~68k sets each time made ~0.9 s per program on a 68k-file
+    // codebase.
     groups: OnceLock<Vec<(Arc<RefSet>, Vec<Path>)>>,
     queries: AtomicUsize,
-    // Referenced path -> indices into `groups` of the sets that contain it.
-    referenced_by: OnceLock<FxHashMap<Path, Vec<u32>>>,
+    referenced_by: OnceLock<ReferencedByIndex>,
 }
 
-const SCAN_QUERIES: usize = 256;
+const SCAN_QUERIES: usize = 4;
+
+// The inverted map of `groups`, inverted by part: a split set's shared part (the checker's ambient module files,
+// ~390 paths shared by nearly every file) is inverted once, not once per file, so building the index costs the
+// files' own paths rather than all ~15 M references.
+#[derive(Default)]
+struct ReferencedByIndex {
+    // Path -> indices into `groups` of the sets whose own paths contain it.
+    own: FxHashMap<Path, Vec<u32>>,
+    // Path -> indices into `shared_parts` of the shared parts that contain it.
+    shared: FxHashMap<Path, Vec<u32>>,
+    // For each distinct shared part, the groups whose sets use it, with the path each of them leaves out.
+    shared_parts: Vec<Vec<(u32, Option<Path>)>>,
+}
+
+impl ReferencedByIndex {
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "each loop appends the same group or part to one entry per path; each entry lists them in group order whatever the order of the paths"
+    )]
+    fn new(groups: &[(Arc<RefSet>, Vec<Path>)]) -> ReferencedByIndex {
+        let mut index = ReferencedByIndex::default();
+        let mut part_of: FxHashMap<*const Set<Path>, u32> = FxHashMap::default();
+        for (i, (refs, _)) in groups.iter().enumerate() {
+            let group = i as u32;
+            for path in refs.own().keys() {
+                index.own.entry(path.clone()).or_default().push(group);
+            }
+            if let Some((shared, skip)) = refs.shared() {
+                let part = *part_of.entry(Arc::as_ptr(shared)).or_insert_with(|| {
+                    let part = index.shared_parts.len() as u32;
+                    for path in shared.keys() {
+                        index.shared.entry(path.clone()).or_default().push(part);
+                    }
+                    index.shared_parts.push(Vec::new());
+                    part
+                });
+                index.shared_parts[part as usize].push((group, skip.cloned()));
+            }
+        }
+        index
+    }
+
+    // The indices into `groups` of the sets that contain `path`. A set's own paths and its shared part minus
+    // `skip` are disjoint (`RefSet::split`), so no set is listed twice.
+    fn groups_referencing<'a>(&'a self, path: &'a Path) -> impl Iterator<Item = u32> + 'a {
+        let own = self.own.get(path).into_iter().flatten().copied();
+        let shared = self.shared.get(path).into_iter().flatten().flat_map(move |&part| {
+            self.shared_parts[part as usize]
+                .iter()
+                .filter(move |(_, skip)| skip.as_ref() != Some(path))
+                .map(|&(group, _)| group)
+        });
+        own.chain(shared)
+    }
+}
 
 impl ReferenceMap {
     // referencemap.go:18, for a set that other entries share.
@@ -107,7 +163,7 @@ impl ReferenceMap {
     }
 
     // referencemap.go:31. Unordered, like Go's `maps.Keys`; every caller sorts it.
-    pub(crate) fn get_referenced_by(&self, path: &Path) -> Vec<Path> {
+    pub fn get_referenced_by(&self, path: &Path) -> Vec<Path> {
         let groups = self.groups.get_or_init(|| {
             let mut index: FxHashMap<*const RefSet, usize> = FxHashMap::default();
             let mut groups: Vec<(Arc<RefSet>, Vec<Path>)> = Vec::new();
@@ -137,23 +193,12 @@ impl ReferenceMap {
             );
             return result;
         }
-        let referenced_by = self.referenced_by.get_or_init(|| {
-            let mut referenced_by: FxHashMap<Path, Vec<u32>> = FxHashMap::default();
-            for (i, (refs, _)) in groups.iter().enumerate() {
-                for r in refs.iter() {
-                    match referenced_by.get_mut(r) {
-                        Some(sets) => sets.push(i as u32),
-                        None => {
-                            referenced_by.insert(r.clone(), vec![i as u32]);
-                        }
-                    }
-                }
-            }
+        let referenced_by = self.referenced_by.get_or_init(|| ReferencedByIndex::new(groups));
+        result.extend(
             referenced_by
-        });
-        if let Some(sets) = referenced_by.get(path) {
-            result.extend(sets.iter().flat_map(|&i| groups[i as usize].1.iter().cloned()));
-        }
+                .groups_referencing(path)
+                .flat_map(|group| groups[group as usize].1.iter().cloned()),
+        );
         result
     }
 }
