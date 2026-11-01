@@ -589,15 +589,15 @@ impl Watcher {
         // above leaves it running. Most such cycles are the events of the last build's own outputs, which come while
         // the job runs, and stopping it there left the placeholders until the next build.
         self.stop_signature_job();
-        if !overflow && !self.config_modified {
-            self.sign_changed_files(&changed_paths);
-        }
         self.report_status(|| {
             new_compiler_diagnostic(
                 &diagnostics::FILE_CHANGE_DETECTED_STARTING_INCREMENTAL_COMPILATION,
                 &[],
             )
         });
+        if !overflow && !self.config_modified {
+            self.sign_changed_files(&changed_paths);
+        }
         if self.do_build(&mut state).is_err() {
             // Mid-cycle watch failure; force a full rebuild on the next event
             wm.force_overflow();
