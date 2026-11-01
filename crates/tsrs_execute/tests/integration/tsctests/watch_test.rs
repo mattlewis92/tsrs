@@ -4,7 +4,10 @@
 // of a program changed (buildtask.rs `old_watch_state`, `single_changed_file`). Each of its scenarios has an edit that
 // one of the conditions of `single_changed_file` must turn into a full build. Content mappers keep transforming in
 // later cycles. `--watch` ignores the events of its own outputs. The signature job, which the harness otherwise skips,
-// spares the first edit of a file the recheck of its importers in both modes.
+// spares the first edit of a file the recheck of its importers in both modes, and so does `--watch`'s signing of the
+// changed files before a cycle builds.
+
+use std::fmt::Write as _;
 
 use rustc_hash::FxHashMap;
 
@@ -433,7 +436,7 @@ fn a_first_edit_after_the_signature_job_rechecks_only_the_edited_file() {
                     )],
                 ),
             ];
-            let baseline = run_with(&name, args, &files, edits, signature_job);
+            let baseline = run_with(&name, args, &files, edits, signature_job, false);
             for (index, caption, edited, importer) in
                 [(0, "comment", "a.ts", "b.ts"), (2, "comment after a cycle", "d.ts", "e.ts")]
             {
@@ -455,6 +458,104 @@ fn a_first_edit_after_the_signature_job_rechecks_only_the_edited_file() {
     }
 }
 
+// The edit `index` of a baseline, from its caption to the next edit.
+fn baseline_edit<'a>(baseline: &'a str, index: usize, caption: &str) -> &'a str {
+    let start = baseline.find(&format!("\nEdit [{index}]:: {caption}\n")).unwrap();
+    &baseline[start
+        ..baseline[start + 1..].find("\nEdit [").map_or(baseline.len(), |end| start + 1 + end)]
+}
+
+fn checked_in(edit: &str, file: &str) -> bool {
+    edit.contains(&format!("*refresh*    {ROOT}/app/{file}\n"))
+}
+
+// Without the signature job, the watch signs a changed file that still holds a placeholder before the cycle builds
+// (watcher.rs `sign_changed_files`), on the program the cycle builds from. A comment edit then rechecks the edited file
+// only, both right after the initial build and for a file a shape change left a placeholder for (d.ts, two imports
+// from a.ts); a shape change still rechecks the files importing the edited one.
+#[test]
+fn a_changed_file_signed_before_the_cycle_rechecks_only_itself() {
+    let config = r#"{ "compilerOptions": { "incremental": true, "target": "esnext" } }"#;
+    let files = [
+        ("app/tsconfig.json", config),
+        ("app/a.ts", "export function f() { return 1; }\n"),
+        ("app/b.ts", "import { f } from \"./a\";\nexport const g = f();\n"),
+        ("app/c.ts", "import { g } from \"./b\";\nexport const h: number = g;\n"),
+        ("app/d.ts", "import { h } from \"./c\";\nexport const k = h;\n"),
+        ("app/e.ts", "import { k } from \"./d\";\nexport const m: number = k;\n"),
+    ];
+    let edits = vec![
+        ("comment", vec![write("app/a.ts", "export function f() { return 1; }\n// comment\n")]),
+        ("shape change", vec![write("app/a.ts", "export function f() { return 's'; }\n")]),
+        (
+            "comment after a cycle",
+            vec![write(
+                "app/d.ts",
+                "import { h } from \"./c\";\nexport const k = h;\n// comment\n",
+            )],
+        ),
+    ];
+    let name = "sign-changed-files";
+    let baseline = run_with(name, &["-w", "-p", "app"], &files, edits, false, true);
+    for (index, caption, edited, importer, importer_checked) in [
+        (0, "comment", "a.ts", "b.ts", false),
+        (1, "shape change", "a.ts", "b.ts", true),
+        (2, "comment after a cycle", "d.ts", "e.ts", false),
+    ] {
+        let edit = baseline_edit(&baseline, index, caption);
+        assert!(checked_in(edit, edited), "{name}: the edited file is checked\n{edit}");
+        assert_eq!(
+            checked_in(edit, importer),
+            importer_checked,
+            "{name}: the importer is checked only after a shape change\n{edit}"
+        );
+    }
+}
+
+// A cycle that changes more files holding a placeholder than `SIGN_CHANGED_FILES_LIMIT` (64) keeps their placeholders,
+// so the file importing them is checked again; at the limit they are signed and it is not.
+#[test]
+fn more_changed_files_than_the_limit_keep_their_placeholders() {
+    let config = r#"{ "compilerOptions": { "incremental": true, "target": "esnext" } }"#;
+    for (count, importer_checked) in [(64, false), (65, true)] {
+        let modules: Vec<(String, String)> = (0..count)
+            .map(|i| {
+                (format!("app/m{i}.ts"), format!("export function f{i}() {{ return {i}; }}\n"))
+            })
+            .collect();
+        let mut importer = String::new();
+        for i in 0..count {
+            let _ = writeln!(
+                importer,
+                "import {{ f{i} }} from \"./m{i}\";\nexport const v{i} = f{i}();"
+            );
+        }
+        let mut files: Vec<(&str, &str)> =
+            vec![("app/tsconfig.json", config), ("app/importer.ts", &importer)];
+        files.extend(modules.iter().map(|(path, text)| (path.as_str(), text.as_str())));
+        let comments: Vec<ScenarioOp> = modules
+            .iter()
+            .map(|(path, text)| write(path, &format!("{text}// comment\n")))
+            .collect();
+        let name = format!("sign-changed-files-limit-{count}");
+        let baseline = run_with(
+            &name,
+            &["-w", "-p", "app"],
+            &files,
+            vec![("comments", comments)],
+            false,
+            true,
+        );
+        let edit = baseline_edit(&baseline, 0, "comments");
+        assert!(checked_in(edit, "m0.ts"), "{name}: the edited files are checked\n{edit}");
+        assert_eq!(
+            checked_in(edit, "importer.ts"),
+            importer_checked,
+            "{name}: the importer is checked only above the limit\n{edit}"
+        );
+    }
+}
+
 // Runs `tsgo <args>` on `files` (paths under ROOT), asserts that no edit differs from a fresh build, and returns the
 // baseline. An edit that only touches files starts no cycle: its output is empty, unlike a fresh build's.
 fn run(
@@ -463,16 +564,18 @@ fn run(
     files: &[(&str, &str)],
     edits: Vec<(&str, Vec<ScenarioOp>)>,
 ) -> String {
-    run_with(name, args, files, edits, false)
+    run_with(name, args, files, edits, false, false)
 }
 
-// `run`, with the watch's signature job after each cycle when `signature_job` is set.
+// `run`, with the watch's signature job after each cycle when `signature_job` is set, and with the changed files
+// signed before each cycle builds when either is.
 fn run_with(
     name: &str,
     args: &[&str],
     files: &[(&str, &str)],
     edits: Vec<(&str, Vec<ScenarioOp>)>,
     signature_job: bool,
+    sign_changed_files: bool,
 ) -> String {
     let mut files: Vec<ScenarioFile> =
         files.iter().map(|(path, content)| file(&format!("{ROOT}/{path}"), content)).collect();
@@ -511,6 +614,7 @@ fn run_with(
         default_libs: vec![LIB_FILE.to_string()],
         edits,
         signature_job,
+        sign_changed_files,
     };
     let baseline = run_scenario(&test);
     let diffs = baseline.matches("\nDiff:: ").count();

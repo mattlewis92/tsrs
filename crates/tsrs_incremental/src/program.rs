@@ -185,6 +185,47 @@ impl Program {
     /// concurrently with anything else that uses this program or its snapshot. Returns the number of signatures
     /// stored.
     pub fn compute_placeholder_signatures(&self, ctx: &Context, chunk: usize) -> usize {
+        let files: Vec<P<SourceFile>> = self
+            .p()
+            .get_source_files()
+            .iter()
+            .copied()
+            .filter(|&file| self.has_placeholder_signature(file))
+            .collect();
+        self.compute_signatures_of(ctx, &files, chunk)
+    }
+
+    /// tsrs-only: the files among `paths` whose signature `compute_placeholder_signatures` would compute, in the
+    /// order of `paths`. A watch signs the files a cycle is about to change with `compute_signatures_of` on the
+    /// program they change from, so that the cycle's affected-file walk compares their new declaration signature
+    /// with the one the files had in this program instead of with the version, which always differs.
+    pub fn placeholder_files_of(&self, paths: &[Path]) -> Vec<P<SourceFile>> {
+        let program = self.p();
+        paths
+            .iter()
+            .filter_map(|path| program.get_source_file_by_path(path))
+            .filter(|&file| self.has_placeholder_signature(file))
+            .collect()
+    }
+
+    fn has_placeholder_signature(&self, file: P<SourceFile>) -> bool {
+        !file.is_declaration_file()
+            && !tsrs_ast::is_json_source_file(file)
+            && self
+                .snapshot
+                .file_infos
+                .load(file.path())
+                .is_some_and(|info| info.signature == info.version)
+    }
+
+    /// tsrs-only: `compute_placeholder_signatures` for `files` only (`placeholder_files_of`), under the same
+    /// conditions.
+    pub fn compute_signatures_of(
+        &self,
+        ctx: &Context,
+        files: &[P<SourceFile>],
+        chunk: usize,
+    ) -> usize {
         let snapshot = self.snapshot;
         if !snapshot.can_use_incremental_state()
             || snapshot.changed_files_set.size() != 0
@@ -193,19 +234,6 @@ impl Program {
             return 0;
         }
         let program = self.p();
-        let files: Vec<P<SourceFile>> = program
-            .get_source_files()
-            .iter()
-            .copied()
-            .filter(|&file| {
-                !file.is_declaration_file()
-                    && !tsrs_ast::is_json_source_file(file)
-                    && snapshot
-                        .file_infos
-                        .load(file.path())
-                        .is_some_and(|info| info.signature == info.version)
-            })
-            .collect();
         let stored = std::sync::atomic::AtomicUsize::new(0);
         let write_file =
             |file_name: &str, text: &str, data: &mut WriteFileData| -> Result<(), String> {

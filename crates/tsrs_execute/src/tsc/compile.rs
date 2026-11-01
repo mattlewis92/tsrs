@@ -197,6 +197,11 @@ pub trait CommandLineTesting: Sync {
     fn run_signature_job(&self) -> bool {
         false
     }
+    // tsrs-only: before a cycle builds, the watch signs the changed files that still hold a placeholder signature
+    // (watcher.rs `sign_changed_files`). With the signature job by default, as both stand in for Go's placeholders.
+    fn sign_changed_files(&self) -> bool {
+        self.run_signature_job()
+    }
     // Go `GetTrace(w, locale)`: the trace function for a program's compiler host, writing to `w`.
     fn get_trace(&'static self, w: SyncWriter, is_sys_writer: bool) -> Box<tsrs_compiler::TraceFn>;
 }

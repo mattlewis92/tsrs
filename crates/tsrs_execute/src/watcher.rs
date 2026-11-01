@@ -108,6 +108,9 @@ impl CompilerHost for WatchCompilerHost {
 // Files per declaration emit of `start_signature_job`: what a new cycle may wait for once it cancels the job.
 pub(crate) const SIGNATURE_JOB_CHUNK: usize = 256;
 
+// The most changed files `sign_changed_files` signs before a cycle builds; past it the cycle keeps their placeholders.
+const SIGN_CHANGED_FILES_LIMIT: usize = 64;
+
 pub struct Watcher {
     sys: &'static dyn System,
     // tsrs-only: what the programs since the last full build share (`install_program`).
@@ -586,6 +589,9 @@ impl Watcher {
         // above leaves it running. Most such cycles are the events of the last build's own outputs, which come while
         // the job runs, and stopping it there left the placeholders until the next build.
         self.stop_signature_job();
+        if !overflow && !self.config_modified {
+            self.sign_changed_files(&changed_paths);
+        }
         self.report_status(|| {
             new_compiler_diagnostic(
                 &diagnostics::FILE_CHANGE_DETECTED_STARTING_INCREMENTAL_COMPILATION,
@@ -1035,6 +1041,50 @@ impl Watcher {
             })
             .expect("failed to spawn a thread");
         self.signature_job = Some((cancel, job));
+    }
+
+    // tsrs-only: before a cycle builds, computes on the program it builds from the declaration signatures of the
+    // changed files that still hold a placeholder (the files the signature job has not reached, or that a cycle
+    // invalidated without computing their declarations). The new snapshot takes each file's signature from this one,
+    // so the cycle's affected-file walk compares a changed file's new declaration signature with its declarations in
+    // this program, and an edit that changes no declaration rechecks that file alone. Compared with the version, which
+    // always differs, the walk invalidated every file importing it, transitively. Above `SIGN_CHANGED_FILES_LIMIT`
+    // such files (a branch switch, say) the cycle keeps the placeholders: the declaration emits would delay it more
+    // than the files they could spare. Like the signature job, it runs in the test harness only for the scenarios that
+    // ask for it (`CommandLineTesting::sign_changed_files`); Go compares with the placeholders.
+    fn sign_changed_files(&self, changed_paths: &FxHashMap<String, EventKind>) {
+        let Some(program) = self.program else { return };
+        if self.testing.is_some_and(|testing| !testing.sign_changed_files()) {
+            return;
+        }
+        let paths: Vec<Path> =
+            sorted_keys(changed_paths).into_iter().map(|p| self.to_path(p)).collect();
+        let files = program.placeholder_files_of(&paths);
+        if files.is_empty() {
+            return;
+        }
+        if files.len() > SIGN_CHANGED_FILES_LIMIT {
+            self.wm.debug(|| {
+                format!(
+                    "[watch] kept the placeholder signatures of {} changed file(s) (more than {SIGN_CHANGED_FILES_LIMIT})\n",
+                    files.len()
+                )
+            });
+            return;
+        }
+        let start = std::time::Instant::now();
+        let stored = program.compute_signatures_of(
+            &tsrs_compiler::Context::default(),
+            &files,
+            SIGNATURE_JOB_CHUNK,
+        );
+        self.wm.debug(|| {
+            format!(
+                "[watch] signed {stored} of {} changed file(s) before the build in {:?}\n",
+                files.len(),
+                start.elapsed()
+            )
+        });
     }
 
     fn stop_signature_job(&mut self) {

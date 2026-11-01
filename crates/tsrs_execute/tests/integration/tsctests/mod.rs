@@ -66,6 +66,9 @@ struct Scenario {
     edits: Vec<ScenarioEdit>,
     // tsrs-only: run the watch's signature job after each cycle (`CommandLineTesting::run_signature_job`).
     signature_job: bool,
+    // tsrs-only: sign the changed files before each cycle builds, also without the signature job
+    // (`CommandLineTesting::sign_changed_files`).
+    sign_changed_files: bool,
 }
 
 fn s(v: Option<&Value>) -> String {
@@ -152,6 +155,7 @@ fn load_scenario(path: &FsPath) -> Scenario {
         default_libs: strings(o.get("defaultLibs")).unwrap_or_default(),
         edits,
         signature_job: false,
+        sign_changed_files: false,
     }
 }
 
@@ -204,6 +208,7 @@ fn new_test_sys(test: &Scenario) -> &'static TestSys {
         test.output_is_tty.unwrap_or(true),
     );
     sys.signature_job = test.signature_job;
+    sys.sign_changed_files = test.sign_changed_files;
     let sys: &'static TestSys = Box::leak(Box::new(sys));
     let watch_fs = Arc::clone(&sys.fs);
     let backend = mockwatch::MockWatchBackend::new(
