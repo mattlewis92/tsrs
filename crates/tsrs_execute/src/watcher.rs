@@ -116,6 +116,9 @@ pub struct Watcher {
     free_replaced: Option<Box<dyn FnOnce() + Send>>,
     // The background computation of the program's placeholder signatures (`start_signature_job`).
     signature_job: Option<(tsrs_core::context::CancelFunc, std::thread::JoinHandle<()>)>,
+    // tsrs-only: the file system cache of the program's host, which the build fills and the signature job reads through
+    // until it ends (`start_signature_job`).
+    program_fs: Option<Arc<cachedvfs::FS<Arc<dyn FS>>>>,
     config_file_name: String,
     config: P<ParsedCommandLine>,
     compiler_options_from_command_line: P<CompilerOptions>,
@@ -203,6 +206,7 @@ pub(crate) fn run_watcher(
         shared_program_data: None,
         free_replaced: None,
         signature_job: None,
+        program_fs: None,
         config_file_name: config
             .config_file
             .map(|f| f.source_file.file_name().to_string())
@@ -761,7 +765,7 @@ impl Watcher {
             if self.try_update_program(host) {
                 self.fast_path_builds += 1;
                 let result = self.compile_and_emit();
-                cached.disable_and_clear_cache();
+                self.set_program_fs(cached);
                 self.record_config_mtimes();
                 self.config_modified = false;
                 self.report_error_count(result.diagnostics.len());
@@ -821,7 +825,7 @@ impl Watcher {
         self.full_builds += 1;
 
         let result = self.compile_and_emit();
-        cached.disable_and_clear_cache();
+        self.set_program_fs(cached);
 
         let seen = tfs.seen_files();
         self.seen_files = seen.iter().map(|p| self.to_path(p)).collect();
@@ -830,6 +834,7 @@ impl Watcher {
         self.record_config_mtimes();
 
         if let Err(err) = self.reconcile_watches(state, &seen) {
+            self.release_program_fs();
             self.sys.write(&format!("{}\n", err.message()));
             // tsrs-only: the build's diagnostics and status line still go out (Go returns here and prints neither);
             // the status line also flushes the output, which would otherwise hold the error until the next cycle.
@@ -1007,7 +1012,15 @@ impl Watcher {
     // the next edit of a file whose declarations do not change rechecks that file instead of everything importing
     // it. The next cycle cancels the computation and waits for the chunk in progress (`stop_signature_job`). The
     // test harness leaves the placeholders, as Go does, unless the scenario asks for the job (`run_signature_job`).
+    //
+    // The job reads the file system through the cache of the program's host, which the build filled, until it ends.
+    // Declaration emit looks up the files a module specifier could name for every type it writes from another module;
+    // with the cache disabled after the build, each lookup was a `stat`, which was 90% of the job's time on a 60k-file
+    // project. The cache is the build's view, the one the program was made from, and the next cycle stops the job
+    // before anything reads the host again.
     fn start_signature_job(&mut self) {
+        // Released however the job ends, a panic included.
+        let release_fs = ReleaseOnDrop(self.program_fs.clone());
         let Some(program) = self.program else { return };
         if let Some(testing) = self.testing {
             if testing.run_signature_job() {
@@ -1020,21 +1033,39 @@ impl Watcher {
         }
         let (ctx, cancel) = tsrs_compiler::Context::default().with_cancel();
         let wm = Arc::clone(&self.wm);
+        let sys = self.sys;
         let job = std::thread::Builder::new()
             .name("tsrs-signatures".to_string())
             .spawn(move || {
                 let start = std::time::Instant::now();
                 let stored = program.compute_placeholder_signatures(&ctx, SIGNATURE_JOB_CHUNK);
-                if let Some(log) = wm.debug_log() {
+                drop(release_fs);
+                if wm.debug_log().is_some() {
                     let state = if ctx.err().is_some() { "canceled" } else { "done" };
-                    log(&format!(
+                    // Flushed at once: the output is otherwise flushed when the next cycle reports.
+                    sys.write(&format!(
                         "[watch] stored {stored} declaration signature(s) in {:?} ({state})\n",
                         start.elapsed()
                     ));
+                    sys.flush();
                 }
             })
             .expect("failed to spawn a thread");
         self.signature_job = Some((cancel, job));
+    }
+
+    // Makes `fs` (a build's file system cache) the program's, releasing the last one.
+    fn set_program_fs(&mut self, fs: Arc<cachedvfs::FS<Arc<dyn FS>>>) {
+        if let Some(last) = self.program_fs.replace(fs) {
+            last.disable_and_clear_cache();
+        }
+    }
+
+    // Releases the program's file system cache when no signature job will.
+    fn release_program_fs(&self) {
+        if let Some(fs) = &self.program_fs {
+            fs.disable_and_clear_cache();
+        }
     }
 
     fn stop_signature_job(&mut self) {
@@ -1196,6 +1227,17 @@ impl Watcher {
         }
         self.extended_config_cache = extended_config_cache;
         config_parse_result.map(P::new)
+    }
+}
+
+// tsrs-only: disables and clears a build's file system cache when dropped (`start_signature_job`).
+struct ReleaseOnDrop(Option<Arc<cachedvfs::FS<Arc<dyn FS>>>>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        if let Some(fs) = &self.0 {
+            fs.disable_and_clear_cache();
+        }
     }
 }
 
